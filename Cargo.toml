@@ -1,0 +1,13 @@
+[package]
+name = "oicq4r"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+hyper = { version = "0.14.20", features = ["full"] }
+hyper-tls = "0.5.0"
+log = "0.4.17"
+protobuf = "3.1.0"
+tokio = { version = "1.21.1", features = ["net", "macros"] }
