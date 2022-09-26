@@ -1,34 +1,6 @@
-use std::{
-    fmt::Display,
-    io::{Read, Write},
-};
+use std::io::{Read, Write};
 
-use super::constant::BUF_7;
-
-#[derive(Debug)]
-pub enum TeaError {
-    EncryptedLength,
-    EncryptedIllegal,
-}
-
-impl std::error::Error for TeaError {}
-
-impl From<std::io::Error> for TeaError {
-    fn from(_: std::io::Error) -> Self {
-        TeaError::EncryptedIllegal
-    }
-}
-
-impl Display for TeaError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TeaError::EncryptedLength => {
-                f.write_str("length of encrypted data must be a multiple of 8")
-            }
-            TeaError::EncryptedIllegal => f.write_str("encrypted data is illegal"),
-        }
-    }
-}
+use super::{constant::BUF_7, error::Error};
 
 static DELTAS: [u32; 16] = [
     0x9e3779b9, 0x3c6ef372, 0xdaa66d2b, 0x78dde6e4, 0x1715609d, 0xb54cda56, 0x5384540f, 0xf1bbcdc8,
@@ -56,7 +28,7 @@ fn encrypt_part(mut x: u32, mut y: u32, k0: u32, k1: u32, k2: u32, k3: u32) -> (
     (x, y)
 }
 
-pub fn encrypt<T, R>(data: R, key: &[u8; 16]) -> Result<Vec<u8>, TeaError>
+pub fn encrypt<T, R>(data: R, key: &[u8; 16]) -> Result<Vec<u8>, Error>
 where
     T: Iterator<Item = u8> + ExactSizeIterator,
     R: IntoIterator<Item = u8, IntoIter = T>,
@@ -126,9 +98,11 @@ fn decrypt_part(mut x: u32, mut y: u32, k0: u32, k1: u32, k2: u32, k3: u32) -> (
     (x as u32, y as u32)
 }
 
-pub fn decrypt(encrypted: &Vec<u8>, key: &[u8; 16]) -> Result<Vec<u8>, TeaError> {
+pub fn decrypt(encrypted: &Vec<u8>, key: &[u8; 16]) -> Result<Vec<u8>, Error> {
     if encrypted.len() % 8 != 0 {
-        return Err(TeaError::EncryptedLength);
+        return Err(Error::from(
+            "length of encrypted data must be a multiple of 8",
+        ));
     }
 
     let mut decrypted = Vec::<u8>::with_capacity(encrypted.len());
@@ -172,6 +146,6 @@ pub fn decrypt(encrypted: &Vec<u8>, key: &[u8; 16]) -> Result<Vec<u8>, TeaError>
     {
         Ok((&decrypted[((decrypted[0] & 0x07) + 3) as usize..decrypted.len() - 7]).to_vec())
     } else {
-        Err(TeaError::EncryptedIllegal)
+        Err(Error::from("encrypted data is illegal"))
     }
 }

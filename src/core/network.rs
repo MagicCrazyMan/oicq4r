@@ -1,22 +1,18 @@
 use hyper::{body::to_bytes, Body, Client, Request};
 use hyper_tls::HttpsConnector;
 use std::{
-    fmt::Display,
-    future::Future,
-    io::{Cursor, Read, Write},
-    net::TcpStream,
+    io::{Read, Write},
+    net::{TcpStream, SocketAddr},
     time::SystemTime,
 };
 
 use crate::define_observer;
 
 use super::{
-    jce::{decode_wrapper, encode_wrapper, JceElement, JceError},
-    tea::{decrypt, encrypt, TeaError},
+    error::Error,
+    jce::{decode_wrapper, encode_wrapper, JceElement},
+    tea::{decrypt, encrypt},
 };
-
-// static DEFAULT_SERVER: (&'static str, u16) = "msfwifi.3g.qq.com";
-// static DEFAULT_PORT: u16 = 8080;
 
 static UPDATE_SERVER_KEY: [u8; 16] = [
     0xf0, 0x44, 0x1f, 0x5f, 0xf4, 0x2d, 0xa5, 0x8f, 0xdc, 0xf7, 0x94, 0x9a, 0xba, 0x62, 0xd4, 0x11,
@@ -30,73 +26,10 @@ static UPDATE_SEVER_REQUEST: [(&str, [u8; 45]); 1] = [(
     ],
 )];
 
-#[derive(Debug)]
-pub struct NetworkError(String);
-
-impl NetworkError {
-    pub fn illegal_data() -> Self {
-        NetworkError("illegal data".to_string())
-    }
-}
-
-impl From<JceError> for NetworkError {
-    fn from(err: JceError) -> Self {
-        Self(err.to_string())
-    }
-}
-
-impl From<String> for NetworkError {
-    fn from(err: String) -> Self {
-        Self(err)
-    }
-}
-
-impl From<&str> for NetworkError {
-    fn from(err: &str) -> Self {
-        Self(err.to_string())
-    }
-}
-
-impl From<TeaError> for NetworkError {
-    fn from(err: TeaError) -> Self {
-        Self(err.to_string())
-    }
-}
-
-impl From<hyper::Error> for NetworkError {
-    fn from(err: hyper::Error) -> Self {
-        Self(err.to_string())
-    }
-}
-
-impl From<hyper::http::Error> for NetworkError {
-    fn from(err: hyper::http::Error) -> Self {
-        Self(err.to_string())
-    }
-}
-
-impl From<tokio::io::Error> for NetworkError {
-    fn from(err: tokio::io::Error) -> Self {
-        Self(err.to_string())
-    }
-}
-
-impl From<tokio::task::JoinError> for NetworkError {
-    fn from(err: tokio::task::JoinError) -> Self {
-        Self(err.to_string())
-    }
-}
-
-impl Display for NetworkError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0.to_string())
-    }
-}
-
 define_observer!(
     NetworkObserver,
-    (connected, ConnectedListeners, ()),
-    (closed, ClosedListeners, ()),
+    (connected, ConnectedListeners, (server: &(String, u16))),
+    (closed, ClosedListeners, (server: &SocketAddr)),
     (error, ErrorListeners, (msg: &str)),
     (packet, PacketListeners, (buf: &[u8]))
 );
@@ -108,11 +41,13 @@ pub enum NetworkState {
     Connected,
 }
 
+#[derive(Debug)]
 pub struct Network {
     state: NetworkState,
     require_close: bool,
     server_last_update_time: Option<SystemTime>,
     server_list: Vec<(String, u16)>,
+    // connected_server: Option<(String, u16)>,
     auto_search: bool,
     observer: NetworkObserver,
 }
@@ -124,6 +59,7 @@ impl Network {
             require_close: false,
             server_last_update_time: None,
             server_list: Vec::new(),
+            // connected_server: None,
             auto_search: true,
             observer: NetworkObserver::new(),
         }
@@ -133,36 +69,43 @@ impl Network {
         self.state
     }
 
+    // pub fn connected_server(&self) -> &Option<(String, u16)>{
+    //     &self.connected_server
+    // }
+
     pub fn observer(&mut self) -> &mut NetworkObserver {
         &mut self.observer
     }
 
-    pub async fn connect(&mut self) -> Result<(), NetworkError> {
+    pub async fn connect(&mut self) -> Result<(), Error> {
         if let NetworkState::Closed = self.state {
             self.state = NetworkState::Connecting;
 
             self.resolve().await?;
 
+            let target_server = self
+                .server_list
+                .first()
+                .unwrap_or(&("msfwifi.3g.qq.com".to_string(), 8080))
+                .clone();
+
             // 使用异步尝试连接服务器
-            let tcp = self.tcp_establish().await?;
+            let tcp = self.tcp_establish(target_server.clone()).await?;
+
             // 将 tcp 流转移到新线程并持续读取数据流
             let _ = self.tcp_reading(tcp);
-
+            
+            // self.connected_server = Some(target_server);
             self.state = NetworkState::Connected;
-            self.observer.connected.raise();
+            self.observer.connected.raise(&target_server);
 
             Ok(())
         } else {
-            Err(NetworkError::from("connecting or connected"))
+            Err(Error::from("connecting or connected"))
         }
     }
 
-    async fn tcp_establish(&mut self) -> Result<TcpStream, NetworkError> {
-        let target_server = self
-            .server_list
-            .first()
-            .unwrap_or(&("msfwifi.3g.qq.com".to_string(), 8080))
-            .clone();
+    async fn tcp_establish(&mut self, target_server: (String, u16)) -> Result<TcpStream, Error> {
         Ok(tokio::spawn(async { TcpStream::connect(target_server) }).await??)
     }
 
@@ -173,7 +116,8 @@ impl Network {
         loop {
             if self.require_close {
                 self.state = NetworkState::Closed;
-                self.observer.closed.raise();
+                // self.connected_server = None;
+                self.observer.closed.raise(&tcp.local_addr().unwrap());
                 return;
             }
 
@@ -196,15 +140,15 @@ impl Network {
                 Err(err) => {
                     self.observer.error.raise(err.to_string().as_str());
                     self.state = NetworkState::Closed;
-                    self.observer.closed.raise();
-                    self.connect();
+                    // self.connected_server = None;
+                    self.observer.closed.raise(&tcp.local_addr().unwrap());
                     return;
                 }
             }
         }
     }
 
-    async fn resolve(&mut self) -> Result<(), NetworkError> {
+    async fn resolve(&mut self) -> Result<(), Error> {
         if !self.auto_search {
             return Ok(());
         }
@@ -229,7 +173,7 @@ impl Network {
     }
 }
 
-async fn update_server_list() -> Result<Vec<(String, u16)>, NetworkError> {
+async fn update_server_list() -> Result<Vec<(String, u16)>, Error> {
     let request_body = encode_wrapper(
         UPDATE_SEVER_REQUEST,
         "ConfigHttp",
@@ -260,27 +204,26 @@ async fn update_server_list() -> Result<Vec<(String, u16)>, NetworkError> {
 
         value
             .remove(&2)
-            .ok_or(NetworkError::illegal_data())
+            .ok_or(Error::illegal_data())
             .and_then(|value| {
                 if let JceElement::List(value) = value {
                     Ok(value)
                 } else {
-                    Err(NetworkError::illegal_data())
+                    Err(Error::illegal_data())
                 }
             })
             .and_then(|value| {
                 value.into_iter().try_for_each(|ele| {
                     if let JceElement::StructBegin(mut ele) = ele {
                         let address =
-                            String::try_from(ele.remove(&1).ok_or(NetworkError::illegal_data())?)?;
+                            String::try_from(ele.remove(&1).ok_or(Error::illegal_data())?)?;
                         let port =
-                            i16::try_from(ele.remove(&2).ok_or(NetworkError::illegal_data())?)?
-                                as u16;
+                            i16::try_from(ele.remove(&2).ok_or(Error::illegal_data())?)? as u16;
 
                         list.push((address, port));
                         Ok(())
                     } else {
-                        Err(NetworkError::illegal_data())
+                        Err(Error::illegal_data())
                     }
                 })?;
                 Ok(())
@@ -288,6 +231,23 @@ async fn update_server_list() -> Result<Vec<(String, u16)>, NetworkError> {
 
         Ok(list)
     } else {
-        Err(NetworkError::illegal_data())
+        Err(Error::illegal_data())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::Network;
+
+    #[tokio::test]
+    async fn test() {
+        let mut network = Network::new();
+        network.observer().connected.on(
+            |_| {
+                println!("Connected");
+            },
+            false,
+        );
+        let _ = network.connect().await;
     }
 }

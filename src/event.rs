@@ -1,5 +1,3 @@
-use std::time::SystemTime;
-
 #[macro_export]
 macro_rules! define_observer {
     ($name:ident, $(($event_name:ident, $container_name:ident, ($($y_name:ident: $y:ty),*))),+) => {
@@ -50,8 +48,15 @@ macro_rules! define_observer {
                     });
                 }
             }
+
+            impl std::fmt::Debug for $container_name {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+                    f.write_str(stringify!(format_args!("Event has {} listeners", self.0.len())))
+                }
+            }
         )+
 
+        #[derive(Debug)]
         pub struct $name {
             $(pub $event_name: $container_name),+,
         }
@@ -69,97 +74,97 @@ macro_rules! define_observer {
     };
 }
 
-#[cfg(test)]
-mod test {
-    use std::time::{Duration, SystemTime};
+// #[cfg(test)]
+// mod test {
+//     use std::time::{Duration, SystemTime};
 
-    define_observer!(TestObserver, (opened, Opened, (time: SystemTime)), (closed, Closed, ()));
-
-    #[test]
-    fn test() {
-        let mut observer = TestObserver::new();
-        let p = observer.opened.on(
-            |time| {
-                println!("{}", time.elapsed().unwrap().as_millis());
-            },
-            false,
-        );
-
-        let time = SystemTime::now();
-        std::thread::sleep(Duration::from_secs(1));
-        observer.opened.raise(time);
-
-        std::thread::sleep(Duration::from_secs(1));
-        observer.opened.raise(time);
-
-        std::thread::sleep(Duration::from_secs(1));
-        observer.opened.un(p);
-        observer.opened.raise(time);
-    }
-}
+//     define_observer!(TestObserver, (opened, Opened, (time: SystemTime)), (closed, Closed, ()));
 
 //     #[test]
 //     fn test() {
-//         let b = Rc::new(RefCell::new(B(0)));
-
-//         let mut aaa = AAA::new();
-
-//         aaa.a.on(
-//             |v| {
-//                 println!("{}", v);
-//             },
-//             false,
-//         );
-//         aaa.a.on(
-//             |v| {
-//                 println!("{}", v + 10);
-//             },
-//             false,
-//         );
-//         aaa.a.on(
-//             |v| {
-//                 let c = v + 10;
-//                 let d = c.wrapping_add(usize::MAX);
-//                 println!("{}", d);
-//             },
-//             false,
-//         );
-//         let b_0 = b.clone();
-//         aaa.a.on(
-//             move |v| {
-//                 b_0.borrow_mut().0 += v * 10;
-//             },
-//             false,
-//         );
-//         let b_0 = b.clone();
-//         aaa.a.on(
-//             move |v| {
-//                 b_0.borrow_mut().0 += v * 20;
+//         let mut observer = TestObserver::new();
+//         let p = observer.opened.on(
+//             |time| {
+//                 println!("{}", time.elapsed().unwrap().as_millis());
 //             },
 //             false,
 //         );
 
-//         let f = |v: usize| {
-//             println!("ddd {}", v);
-//         };
-//         aaa.a.on(f, false);
+//         let time = SystemTime::now();
+//         std::thread::sleep(Duration::from_secs(1));
+//         observer.opened.raise(time);
 
-//         let _ = aaa.a.on(
-//             |v| {
-//                 println!("once {}", v);
-//             },
-//             true,
-//         );
-//         let p = aaa.a.on(
-//             |v| {
-//                 println!("un {}", v);
-//             },
-//             false,
-//         );
-//         aaa.a.raise(5);
-//         aaa.a.un(p);
-//         aaa.a.raise(15);
+//         std::thread::sleep(Duration::from_secs(1));
+//         observer.opened.raise(time);
 
-//         // println!("{}", b.borrow().0);
+//         std::thread::sleep(Duration::from_secs(1));
+//         observer.opened.un(p);
+//         observer.opened.raise(time);
 //     }
 // }
+
+// //     #[test]
+// //     fn test() {
+// //         let b = Rc::new(RefCell::new(B(0)));
+
+// //         let mut aaa = AAA::new();
+
+// //         aaa.a.on(
+// //             |v| {
+// //                 println!("{}", v);
+// //             },
+// //             false,
+// //         );
+// //         aaa.a.on(
+// //             |v| {
+// //                 println!("{}", v + 10);
+// //             },
+// //             false,
+// //         );
+// //         aaa.a.on(
+// //             |v| {
+// //                 let c = v + 10;
+// //                 let d = c.wrapping_add(usize::MAX);
+// //                 println!("{}", d);
+// //             },
+// //             false,
+// //         );
+// //         let b_0 = b.clone();
+// //         aaa.a.on(
+// //             move |v| {
+// //                 b_0.borrow_mut().0 += v * 10;
+// //             },
+// //             false,
+// //         );
+// //         let b_0 = b.clone();
+// //         aaa.a.on(
+// //             move |v| {
+// //                 b_0.borrow_mut().0 += v * 20;
+// //             },
+// //             false,
+// //         );
+
+// //         let f = |v: usize| {
+// //             println!("ddd {}", v);
+// //         };
+// //         aaa.a.on(f, false);
+
+// //         let _ = aaa.a.on(
+// //             |v| {
+// //                 println!("once {}", v);
+// //             },
+// //             true,
+// //         );
+// //         let p = aaa.a.on(
+// //             |v| {
+// //                 println!("un {}", v);
+// //             },
+// //             false,
+// //         );
+// //         aaa.a.raise(5);
+// //         aaa.a.un(p);
+// //         aaa.a.raise(15);
+
+// //         // println!("{}", b.borrow().0);
+// //     }
+// // }
