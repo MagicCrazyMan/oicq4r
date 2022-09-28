@@ -2,7 +2,7 @@ use hyper::{body::to_bytes, Body, Client, Request};
 use hyper_tls::HttpsConnector;
 use std::{
     io::{Read, Write},
-    net::{TcpStream, SocketAddr},
+    net::{SocketAddr, TcpStream},
     time::SystemTime,
 };
 
@@ -28,7 +28,7 @@ static UPDATE_SEVER_REQUEST: [(&str, [u8; 45]); 1] = [(
 
 define_observer!(
     NetworkObserver,
-    (connected, ConnectedListeners, (server: &(String, u16))),
+    (connected, ConnectedListeners, (server: &SocketAddr)),
     (closed, ClosedListeners, (server: &SocketAddr)),
     (error, ErrorListeners, (msg: &str)),
     (packet, PacketListeners, (buf: &[u8]))
@@ -49,7 +49,7 @@ pub struct Network {
     server_list: Vec<(String, u16)>,
     // connected_server: Option<(String, u16)>,
     auto_search: bool,
-    observer: NetworkObserver,
+    pub observer: NetworkObserver,
 }
 
 impl Network {
@@ -69,14 +69,6 @@ impl Network {
         self.state
     }
 
-    // pub fn connected_server(&self) -> &Option<(String, u16)>{
-    //     &self.connected_server
-    // }
-
-    pub fn observer(&mut self) -> &mut NetworkObserver {
-        &mut self.observer
-    }
-
     pub async fn connect(&mut self) -> Result<(), Error> {
         if let NetworkState::Closed = self.state {
             self.state = NetworkState::Connecting;
@@ -91,13 +83,8 @@ impl Network {
 
             // 使用异步尝试连接服务器
             let tcp = self.tcp_establish(target_server.clone()).await?;
-
             // 将 tcp 流转移到新线程并持续读取数据流
             let _ = self.tcp_reading(tcp);
-            
-            // self.connected_server = Some(target_server);
-            self.state = NetworkState::Connected;
-            self.observer.connected.raise(&target_server);
 
             Ok(())
         } else {
@@ -106,7 +93,11 @@ impl Network {
     }
 
     async fn tcp_establish(&mut self, target_server: (String, u16)) -> Result<TcpStream, Error> {
-        Ok(tokio::spawn(async { TcpStream::connect(target_server) }).await??)
+        let tcp = tokio::spawn(async { TcpStream::connect(target_server) }).await??;
+        self.state = NetworkState::Connected;
+        self.observer.connected.raise(&tcp.local_addr().unwrap());
+
+        Ok(tcp)
     }
 
     async fn tcp_reading(&mut self, mut tcp: TcpStream) {
@@ -235,6 +226,12 @@ async fn update_server_list() -> Result<Vec<(String, u16)>, Error> {
     }
 }
 
+impl Drop for Network {
+    fn drop(&mut self) {
+        self.require_close = true;
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::Network;
@@ -242,7 +239,7 @@ mod test {
     #[tokio::test]
     async fn test() {
         let mut network = Network::new();
-        network.observer().connected.on(
+        network.observer.connected.on(
             |_| {
                 println!("Connected");
             },

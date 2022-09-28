@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::{borrow::BorrowMut, cell::RefCell, rc::Rc};
 
 use log::Level;
 
@@ -43,46 +43,8 @@ pub struct SIG {
     pub time_diff: u128,
 }
 
-impl SIG {
-    pub fn new(
-        seq: u32,
-        session: [u8; 4],
-        randkey: [u8; 16],
-        tgtgt: [u8; 16],
-        tgt: [u8; 0],
-        skey: [u8; 0],
-        d2: [u8; 0],
-        d2key: [u8; 0],
-        t104: [u8; 0],
-        t174: [u8; 0],
-        qrsig: [u8; 0],
-        bigdata: BigData,
-        hb480: Vec<u8>,
-        emp_time: u128,
-        time_diff: u128,
-    ) -> Self {
-        Self {
-            seq,
-            session,
-            randkey,
-            tgtgt,
-            tgt,
-            skey,
-            d2,
-            d2key,
-            t104,
-            t174,
-            qrsig,
-            bigdata,
-            hb480,
-            emp_time,
-            time_diff,
-        }
-    }
-}
-
 define_observer! {
-    BaseClientObserver,
+    Observer,
     (internal_qrcode, QrcodeListener, (qrcode: &[u8; 16])),
     (internal_slider, SliderListener, (url: &str)),
     (internal_verify, VerifyListener, (url: &str, phone: &str)),
@@ -97,47 +59,37 @@ define_observer! {
     (internal_verbose, VerboseListener, (verbose: &str, level: Level))
 }
 
-pub struct BaseClient {
-    observer: BaseClientObserver,
-    network: Network,
+struct BaseClientWrapped {
     uin: u32,
     apk: APK,
     device: FullDevice,
     sig: SIG,
+    observer: Observer,
+    network: Network,
 }
 
-impl BaseClient {
-    // fn on_network_error(base_client: &mut BaseClient, code: i64, message: &str) {
-    //     let a = A(base_client);
-    //     base_client
-    //         .observer()
-    //         .internal_error_network
-    //         .raise(&a, code, message)
-    // }
-
-    fn on_packet(&mut self, packet: &[u8]) {
-        
+impl BaseClientWrapped {
+    fn new(uin: u32, platform: Platform, d: Option<ShortDevice>) -> Self {
+        Self {
+            uin,
+            apk: platform.metadata(),
+            device: FullDevice::from(d.unwrap_or(ShortDevice::generate(uin))),
+            sig: todo!(),
+            network: Network::new(),
+            observer: Observer::new(),
+        }
     }
 }
 
+pub struct BaseClient(Rc<RefCell<BaseClientWrapped>>);
+
 impl BaseClient {
     pub fn new(uin: u32, platform: Platform, d: Option<ShortDevice>) -> Self {
-        let observer = BaseClientObserver::new();
-        let apk = platform.metadata();
-        let device = FullDevice::from(d.unwrap_or(ShortDevice::generate(uin)));
-        let network = Network::new();
-        // let sig = SIG::ne
-
-        let mut instance = Self {
-            observer,
-            network,
-            uin,
-            apk,
-            device,
-            sig: todo!(),
-        };
-        instance.init_verbose();
-        instance.init_packet();
+        let instance = Self(Rc::new(RefCell::new(BaseClientWrapped::new(
+            uin, platform, d,
+        ))));
+        instance.register_verbose();
+        // instance.init_packet();
 
         instance
     }
@@ -146,13 +98,14 @@ impl BaseClient {
         Self::new(uin, Platform::Android, None)
     }
 
-    fn init_verbose(&mut self) {
-        let p = self as *mut BaseClient;
+    fn register_verbose(&self) {
+        let mut m = (*self.0).borrow_mut();
 
-        self.network.observer().error.on(
-            move |err| unsafe {
-                let base_client = &mut *p;
-                base_client
+        let a = Rc::clone(&self.0);
+        m.network.observer.error.on(
+            move |err| {
+                let mut b = (*a).borrow_mut();
+                b.borrow_mut()
                     .observer
                     .internal_verbose
                     .raise(err, Level::Error);
@@ -160,12 +113,11 @@ impl BaseClient {
             false,
         );
 
-        self.network.observer().closed.on(
-            move |server| unsafe {
-                let base_client = &mut *p;
-
-                // let
-                base_client.observer.internal_verbose.raise(
+        let a = Rc::clone(&self.0);
+        m.network.observer.closed.on(
+            move |server| {
+                let mut b = (*a).borrow_mut();
+                b.observer.internal_verbose.raise(
                     format!("{}:{} closed", server.ip(), server.port()).as_str(),
                     Level::Error,
                 );
@@ -173,13 +125,12 @@ impl BaseClient {
             false,
         );
 
-        self.network.observer().connected.on(
-            move |server| unsafe {
-                let base_client = &mut *p;
-
-                // let
-                base_client.observer.internal_verbose.raise(
-                    format!("{}:{} connected", server.0, server.1).as_str(),
+        let a = Rc::clone(&self.0);
+        m.network.observer.connected.on(
+            move |server| {
+                let mut b = (*a).borrow_mut();
+                b.observer.internal_verbose.raise(
+                    format!("{}:{} connected", server.ip(), server.port()).as_str(),
                     Level::Error,
                 );
             },
@@ -187,48 +138,46 @@ impl BaseClient {
         );
     }
 
-    fn init_packet(&mut self) {
-        let p = self as *mut BaseClient;
+    // fn init_packet(&mut self) {
+    //     self.network.observer.packet.on(
+    //         |packet| {
+    //             self.data.borrow_mut().apk.appid = 0;
+    //         },
+    //         false,
+    //     );
+    // }
 
-        self.network.observer().packet.on(
-            move |packet| unsafe {
-                (&mut *p).on_packet(packet);
-            },
-            false,
-        );
-    }
-
-    pub fn observer(&mut self) -> &mut BaseClientObserver {
-        &mut self.observer
-    }
+    // pub fn observer(&mut self) -> &mut BaseClientObserver {
+    //     &mut self.observer
+    // }
 }
 
 impl BaseClient {
     pub fn uin(&self) -> u32 {
-        self.uin
+        (*self.0).borrow().uin
     }
 
     pub fn device(&self) -> &FullDevice {
-        &self.device
+        &(*self.0).borrow().device
     }
 
     pub fn apk(&self) -> APK {
-        self.apk
+        (*self.0).borrow().apk
     }
 
     pub fn sig(&self) -> &SIG {
-        &self.sig
+        &(*self.0).borrow().sig
     }
 }
 
-impl AsRef<BaseClient> for BaseClient {
-    fn as_ref(&self) -> &BaseClient {
+impl AsRef<BaseClientWrapped> for BaseClientWrapped {
+    fn as_ref(&self) -> &BaseClientWrapped {
         self
     }
 }
 
-impl AsMut<BaseClient> for BaseClient {
-    fn as_mut(&mut self) -> &mut BaseClient {
+impl AsMut<BaseClientWrapped> for BaseClientWrapped {
+    fn as_mut(&mut self) -> &mut BaseClientWrapped {
         self
     }
 }
