@@ -5,7 +5,7 @@ use std::{
 
 use protobuf::{rt::WireType, CodedInputStream, CodedOutputStream};
 
-use super::error::Error;
+use super::error::CommonError;
 
 #[derive(Debug, Clone)]
 pub enum ProtobufElement {
@@ -120,7 +120,7 @@ pub fn encode_element(
     writer: &mut CodedOutputStream,
     tag: u32,
     element: &ProtobufElement,
-) -> Result<(), Error> {
+) -> Result<(), CommonError> {
     match element {
         ProtobufElement::Null => {}
         ProtobufElement::Integer(value) => {
@@ -154,7 +154,7 @@ pub fn encode_element(
 
 /// debug 模式下，HashMap 会按照 key(u8) 排序后生成 JceObject，以方便配合 nodejs debug
 #[cfg(debug_assertions)]
-fn encode_object(writer: &mut CodedOutputStream, object: &ProtobufObject) -> Result<(), Error> {
+fn encode_object(writer: &mut CodedOutputStream, object: &ProtobufObject) -> Result<(), CommonError> {
     let mut list = object.iter().collect::<Vec<_>>();
     list.sort_by(|a, b| (*a.0).cmp(b.0));
 
@@ -163,13 +163,13 @@ fn encode_object(writer: &mut CodedOutputStream, object: &ProtobufObject) -> Res
 }
 
 #[cfg(not(debug_assertions))]
-fn encode_object(writer: &mut CodedOutputStream, object: &ProtobufObject) -> Result<(), Error> {
+fn encode_object(writer: &mut CodedOutputStream, object: &ProtobufObject) -> Result<(), CommonError> {
     object
         .iter()
         .try_for_each(|(tag, element)| encode_element(writer, *tag, element))
 }
 
-pub fn encode_stream<W>(writer: &mut W, object: &ProtobufObject) -> Result<(), Error>
+pub fn encode_stream<W>(writer: &mut W, object: &ProtobufObject) -> Result<(), CommonError>
 where
     W: Write,
 {
@@ -177,7 +177,7 @@ where
     encode_object(&mut coded_stream, object)
 }
 
-pub fn encode_with_capacity(object: &ProtobufObject, capacity: usize) -> Result<Vec<u8>, Error> {
+pub fn encode_with_capacity(object: &ProtobufObject, capacity: usize) -> Result<Vec<u8>, CommonError> {
     let mut buf = Vec::with_capacity(capacity);
     let mut coded_stream = CodedOutputStream::new(&mut buf);
     encode_object(&mut coded_stream, object)?;
@@ -186,7 +186,7 @@ pub fn encode_with_capacity(object: &ProtobufObject, capacity: usize) -> Result<
     Ok(buf)
 }
 
-pub fn encode(object: &ProtobufObject) -> Result<Vec<u8>, Error> {
+pub fn encode(object: &ProtobufObject) -> Result<Vec<u8>, CommonError> {
     encode_with_capacity(object, 1000)
 }
 
@@ -235,14 +235,14 @@ pub fn encode(object: &ProtobufObject) -> Result<Vec<u8>, Error> {
 #[cfg(test)]
 mod test {
     use crate::core::{
-        error::Error,
+        error::CommonError,
         writer::{write_bytes, write_u32},
     };
 
     use super::{encode, ProtobufElement, ProtobufObject};
 
     #[test]
-    fn test() -> Result<(), Error> {
+    fn test() -> Result<(), CommonError> {
         let mut buf = Vec::with_capacity(9);
         write_u32(&mut buf, 324372432)?;
         write_bytes(&mut buf, [0x00, 0x00, 0x01, 0x9e, 0x39])?;

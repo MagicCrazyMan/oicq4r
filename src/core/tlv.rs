@@ -5,9 +5,9 @@ use std::{
 
 use super::{
     base_client::BaseClient,
-    constant::BUF_0,
+    constant::{BUF_1, BUF_0},
     device::Platform,
-    error::Error,
+    error::CommonError,
     protobuf::{encode, ProtobufElement, ProtobufObject},
     tea,
     writer::{write_bytes, write_i32, write_tlv, write_u16, write_u32, write_u64, write_u8},
@@ -20,7 +20,7 @@ fn current_timestamp() -> u128 {
         .as_millis()
 }
 
-fn pack_body<W: Write>(
+async fn pack_body<W: Write>(
     writer: &mut W,
     base_client: &BaseClient,
     tag: u16,
@@ -28,7 +28,7 @@ fn pack_body<W: Write>(
     md5pass: Option<Vec<u8>>,
     code: Option<Vec<u8>>,
     ticket: Option<Vec<u8>>,
-) -> Result<(), Error> {
+) -> Result<(), CommonError> {
     match tag {
         0x01 => {
             write_u16(writer, 1)?;
@@ -120,7 +120,7 @@ fn pack_body<W: Write>(
             Ok(())
         }
         0x104 => {
-            write_bytes(writer, base_client.sig().t104)?;
+            write_bytes(writer, base_client.sig().await.t104)?;
             Ok(())
         }
         0x106 => {
@@ -136,7 +136,7 @@ fn pack_body<W: Write>(
             write_bytes(&mut body, [0; 4])?;
             write_u8(&mut body, 1)?;
             write_bytes(&mut body, &md5pass)?;
-            write_bytes(&mut body, base_client.sig().tgtgt)?;
+            write_bytes(&mut body, base_client.sig().await.tgtgt)?;
             write_u32(&mut body, 0)?;
             write_u8(&mut body, 1)?;
             write_bytes(&mut body, base_client.device().guid)?;
@@ -167,7 +167,7 @@ fn pack_body<W: Write>(
             Ok(())
         }
         0x10a => {
-            write_bytes(writer, base_client.sig().tgt)?;
+            write_bytes(writer, base_client.sig().await.tgt)?;
             Ok(())
         }
         0x116 => {
@@ -211,7 +211,7 @@ fn pack_body<W: Write>(
             Ok(())
         }
         0x143 => {
-            write_bytes(writer, base_client.sig().d2)?;
+            write_bytes(writer, base_client.sig().await.d2)?;
             Ok(())
         }
         // 0x144 => {
@@ -234,7 +234,7 @@ fn pack_body<W: Write>(
             Ok(())
         }
         0x154 => {
-            write_u32(writer, base_client.sig().seq + 1)?;
+            write_u32(writer, base_client.sig().await.seq + 1)?;
             Ok(())
         }
         0x16e => {
@@ -242,7 +242,7 @@ fn pack_body<W: Write>(
             Ok(())
         }
         0x174 => {
-            write_bytes(writer, base_client.sig().t174)?;
+            write_bytes(writer, base_client.sig().await.t174)?;
             Ok(())
         }
         0x177 => {
@@ -280,11 +280,11 @@ fn pack_body<W: Write>(
             Ok(())
         }
         0x197 => {
-            write_tlv(writer, BUF_0)?;
+            write_tlv(writer, BUF_1)?;
             Ok(())
         }
         0x198 => {
-            write_tlv(writer, BUF_0)?;
+            write_tlv(writer, BUF_1)?;
             Ok(())
         }
         0x202 => {
@@ -367,13 +367,13 @@ fn pack_body<W: Write>(
             write_bytes(writer, &buf)?;
             Ok(())
         }
-        _ => Err(Error::from("Invalid Input")),
+        _ => Err(CommonError::from("Invalid Input")),
     }
 }
 
-pub fn pack_tlv(base_client: &BaseClient, tag: u16) -> Result<Vec<u8>, Error> {
+pub async fn pack_tlv(base_client: &BaseClient, tag: u16) -> Result<Vec<u8>, CommonError> {
     let mut body = Vec::with_capacity(200);
-    pack_body(&mut body, base_client, tag, None, None, None, None)?;
+    pack_body(&mut body, base_client, tag, None, None, None, None).await?;
     let len = body.len();
     write_u16(&mut body, len as u16)?;
     write_u16(&mut body, tag)?;

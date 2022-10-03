@@ -1,18 +1,28 @@
 use hyper::{body::to_bytes, Body, Client, Request};
 use hyper_tls::HttpsConnector;
 use std::{
-    io::{Read, Write},
-    net::{SocketAddr, TcpStream},
-    time::SystemTime,
+    borrow::BorrowMut,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpStream,
+    },
+    sync::{self, Mutex},
+    task::JoinHandle,
 };
 
-use crate::define_observer;
-
 use super::{
-    error::Error,
+    error::CommonError,
     jce::{decode_wrapper, encode_wrapper, JceElement},
     tea::{decrypt, encrypt},
 };
+
+static DEFAULT_SERVER: (&'static str, u16) = ("msfwifi.3g.qq.com", 8080);
 
 static UPDATE_SERVER_KEY: [u8; 16] = [
     0xf0, 0x44, 0x1f, 0x5f, 0xf4, 0x2d, 0xa5, 0x8f, 0xdc, 0xf7, 0x94, 0x9a, 0xba, 0x62, 0xd4, 0x11,
@@ -26,14 +36,6 @@ static UPDATE_SEVER_REQUEST: [(&str, [u8; 45]); 1] = [(
     ],
 )];
 
-define_observer!(
-    NetworkObserver,
-    (connected, ConnectedListeners, (server: &SocketAddr)),
-    (closed, ClosedListeners, (server: &SocketAddr)),
-    (error, ErrorListeners, (msg: &str)),
-    (packet, PacketListeners, (buf: &[u8]))
-);
-
 #[derive(Debug, Clone, Copy)]
 pub enum NetworkState {
     Closed,
@@ -43,128 +45,194 @@ pub enum NetworkState {
 
 #[derive(Debug)]
 pub struct Network {
-    state: NetworkState,
-    require_close: bool,
+    tcp_writer: Arc<Mutex<Option<OwnedWriteHalf>>>,
+    tcp_reader_handler: Option<JoinHandle<()>>,
+    state: Arc<Mutex<NetworkState>>,
+
     server_last_update_time: Option<SystemTime>,
     server_list: Vec<(String, u16)>,
-    // connected_server: Option<(String, u16)>,
     auto_search: bool,
-    pub observer: NetworkObserver,
+
+    state_tx: sync::broadcast::Sender<(NetworkState, Option<SocketAddr>)>,
+    error_tx: sync::broadcast::Sender<CommonError>,
+    packet_tx: sync::broadcast::Sender<Vec<u8>>,
 }
 
 impl Network {
     pub fn new() -> Self {
         Self {
-            state: NetworkState::Closed,
-            require_close: false,
+            tcp_writer: Arc::new(Mutex::new(None)),
+            tcp_reader_handler: None,
+            state: Arc::new(Mutex::new(NetworkState::Closed)),
+
             server_last_update_time: None,
-            server_list: Vec::new(),
-            // connected_server: None,
+            server_list: vec![],
             auto_search: true,
-            observer: NetworkObserver::new(),
+
+            state_tx: sync::broadcast::channel(1).0,
+            error_tx: sync::broadcast::channel(1).0,
+            packet_tx: sync::broadcast::channel(1).0,
         }
     }
 
-    pub fn state(&self) -> NetworkState {
-        self.state
+    pub fn on_error(&self) -> sync::broadcast::Receiver<CommonError> {
+        self.error_tx.subscribe()
     }
 
-    pub async fn connect(&mut self) -> Result<(), Error> {
-        if let NetworkState::Closed = self.state {
-            self.state = NetworkState::Connecting;
+    pub fn on_packet(&self) -> sync::broadcast::Receiver<Vec<u8>> {
+        self.packet_tx.subscribe()
+    }
 
-            self.resolve().await?;
+    pub fn on_state(&self) -> sync::broadcast::Receiver<(NetworkState, Option<SocketAddr>)> {
+        self.state_tx.subscribe()
+    }
 
-            let target_server = self
-                .server_list
-                .first()
-                .unwrap_or(&("msfwifi.3g.qq.com".to_string(), 8080))
-                .clone();
+    pub async fn state(&self) -> NetworkState {
+        *self.state.lock().await
+    }
 
-            // 使用异步尝试连接服务器
-            let tcp = self.tcp_establish(target_server.clone()).await?;
-            // 将 tcp 流转移到新线程并持续读取数据流
-            let _ = self.tcp_reading(tcp);
+    pub async fn connect(&mut self) -> Result<(), CommonError> {
+        if let NetworkState::Closed = self.state().await {
+            // 更新状态至 Connecting
+            *self.state.lock().await = NetworkState::Connecting;
+            self.state_tx.send((NetworkState::Connecting, None))?;
+
+            // 使用尝试连接服务器
+            let tcp = TcpStream::connect(self.resolve().await?).await?;
+
+            // 更新状态至 Connected
+            *self.state.lock().await = NetworkState::Connected;
+            self.state_tx
+                .send((NetworkState::Connected, tcp.peer_addr().ok()))?;
+
+            let (readable, writeable) = tcp.into_split();
+            // 保留 tcp 写入流
+            *self.tcp_writer.lock().await = Some(writeable);
+            // 使用读取流持续读取内容
+            self.tcp_reader_handler = Some(self.read_packets(readable));
 
             Ok(())
         } else {
-            Err(Error::from("connecting or connected"))
+            Err(CommonError::from("connecting or connected"))
         }
     }
 
-    async fn tcp_establish(&mut self, target_server: (String, u16)) -> Result<TcpStream, Error> {
-        let tcp = tokio::spawn(async { TcpStream::connect(target_server) }).await??;
-        self.state = NetworkState::Connected;
-        self.observer.connected.raise(&tcp.local_addr().unwrap());
+    pub async fn disconnect(&mut self) {
+        if let NetworkState::Connected = self.state().await {
+            if let Some(mut stream) = self.tcp_writer.lock().await.take() {
+                let _ = stream.shutdown().await;
+            }
+            self.tcp_reader_handler = None;
 
-        Ok(tcp)
+            // Closed 事件会等待异步线程结束后触发
+        }
     }
 
-    async fn tcp_reading(&mut self, mut tcp: TcpStream) {
-        let mut buf = Vec::with_capacity(100);
+    pub async fn write(&mut self, bytes: &[u8]) -> Result<(), CommonError> {
+        if let NetworkState::Connected = self.state().await {
+            let mut writer = self.tcp_writer.lock().await;
+            let writer = writer.borrow_mut().as_mut().unwrap();
+            writer.write_all(bytes).await?;
+            Ok(())
+        } else {
+            Err(CommonError::new("not connected"))
+        }
+    }
 
-        let mut ready_buf = Vec::<u8>::with_capacity(2000);
-        loop {
-            if self.require_close {
-                self.state = NetworkState::Closed;
-                // self.connected_server = None;
-                self.observer.closed.raise(&tcp.local_addr().unwrap());
-                return;
+    async fn resolve(&mut self) -> Result<(&str, u16), CommonError> {
+        if !self.auto_search {
+            return Ok(DEFAULT_SERVER);
+        }
+
+        if self
+            .server_last_update_time
+            .and_then(|time| Some(time.elapsed().unwrap_or(Duration::from_secs(3600))))
+            .unwrap_or(Duration::from_secs(3600))
+            .as_secs()
+            >= 3600
+        {
+            // NodeJS 代码中原作者说明了第一和第二个是网络状态最好的,所以做了筛选
+            // 但是这里就不做筛选了,因为没有必要,上面的代码默认就是用第一个
+            let server_list = update_server_list().await?;
+            if !server_list.is_empty() {
+                self.server_list = server_list;
+                self.server_last_update_time = Some(SystemTime::now());
             }
+        }
 
-            match tcp.read(&mut buf) {
-                Ok(len) => {
-                    ready_buf.write_all(&buf[..len]).unwrap();
+        let target_server = self
+            .server_list
+            .first()
+            .and_then(|(addr, port)| Some((addr.as_str(), *port)))
+            .unwrap_or(DEFAULT_SERVER);
 
-                    while ready_buf.len() > 4 {
-                        let len = u32::from_be_bytes(ready_buf[..4].try_into().unwrap()) as usize;
-                        if ready_buf.len() - 4 >= len {
-                            let packet_buf =
-                                ready_buf.splice(..4 + len, []).skip(4).collect::<Vec<_>>();
+        Ok(target_server)
+    }
 
-                            self.observer.packet.raise(&packet_buf);
-                        } else {
+    fn read_packets(&mut self, mut reader: OwnedReadHalf) -> JoinHandle<()> {
+        let state = Arc::clone(&self.state);
+        let packet_tx = self.packet_tx.clone();
+        let state_tx = self.state_tx.clone();
+        let error_tx = self.error_tx.clone();
+
+        tokio::spawn(async move {
+            // 断开 tcp 之后 peer_addr 会返回 None，因此需要提前拿出来
+            let remote_addr = reader.peer_addr().ok();
+
+            let state = state;
+            let packet_tx = packet_tx;
+            let state_tx = state_tx;
+            let error_tx = error_tx;
+
+            let mut error = None;
+            let mut buf = Vec::with_capacity(100);
+            let mut ready_buf = Vec::<u8>::with_capacity(2000);
+
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(len) => {
+                        if len == 0 {
                             break;
                         }
+
+                        ready_buf.write_all(&buf[..len]).await.unwrap();
+                        while ready_buf.len() > 4 {
+                            let len =
+                                u32::from_be_bytes(ready_buf[..4].try_into().unwrap()) as usize;
+                            if ready_buf.len() - 4 >= len {
+                                let packet_buf =
+                                    ready_buf.splice(..4 + len, []).skip(4).collect::<Vec<_>>();
+
+                                match packet_tx.send(packet_buf) {
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        error = Some(CommonError::from(err));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        error = Some(CommonError::from(err));
+                        break;
                     }
                 }
-                Err(err) => {
-                    self.observer.error.raise(err.to_string().as_str());
-                    self.state = NetworkState::Closed;
-                    // self.connected_server = None;
-                    self.observer.closed.raise(&tcp.local_addr().unwrap());
-                    return;
-                }
             }
-        }
-    }
 
-    async fn resolve(&mut self) -> Result<(), Error> {
-        if !self.auto_search {
-            return Ok(());
-        }
-
-        if let Some(duration) = self
-            .server_last_update_time
-            .and_then(|time| Some(time.elapsed().unwrap()))
-        {
-            if duration.as_secs() < 3600 {
-                return Ok(());
+            if let Some(err) = error {
+                error_tx.send(err).unwrap();
             }
-        }
 
-        // NodeJS 代码中原作者说明了第一和第二个是网络状态最好的,所以做了筛选
-        // 但是这里就不做筛选了,因为没有必要,上面的代码默认就是用第一个
-        let server_list = update_server_list().await?;
-        if !server_list.is_empty() {
-            self.server_list = server_list;
-            self.server_last_update_time = Some(SystemTime::now());
-        }
-        Ok(())
+            *state.lock().await = NetworkState::Closed;
+            state_tx
+                .send((NetworkState::Closed, remote_addr))
+                .unwrap();
+        })
     }
 }
 
-async fn update_server_list() -> Result<Vec<(String, u16)>, Error> {
+async fn update_server_list() -> Result<Vec<(String, u16)>, CommonError> {
     let request_body = encode_wrapper(
         UPDATE_SEVER_REQUEST,
         "ConfigHttp",
@@ -195,26 +263,26 @@ async fn update_server_list() -> Result<Vec<(String, u16)>, Error> {
 
         value
             .remove(&2)
-            .ok_or(Error::illegal_data())
+            .ok_or(CommonError::illegal_data())
             .and_then(|value| {
                 if let JceElement::List(value) = value {
                     Ok(value)
                 } else {
-                    Err(Error::illegal_data())
+                    Err(CommonError::illegal_data())
                 }
             })
             .and_then(|value| {
                 value.into_iter().try_for_each(|ele| {
                     if let JceElement::StructBegin(mut ele) = ele {
                         let address =
-                            String::try_from(ele.remove(&1).ok_or(Error::illegal_data())?)?;
+                            String::try_from(ele.remove(&1).ok_or(CommonError::illegal_data())?)?;
                         let port =
-                            i16::try_from(ele.remove(&2).ok_or(Error::illegal_data())?)? as u16;
+                            i16::try_from(ele.remove(&2).ok_or(CommonError::illegal_data())?)? as u16;
 
                         list.push((address, port));
                         Ok(())
                     } else {
-                        Err(Error::illegal_data())
+                        Err(CommonError::illegal_data())
                     }
                 })?;
                 Ok(())
@@ -222,29 +290,63 @@ async fn update_server_list() -> Result<Vec<(String, u16)>, Error> {
 
         Ok(list)
     } else {
-        Err(Error::illegal_data())
-    }
-}
-
-impl Drop for Network {
-    fn drop(&mut self) {
-        self.require_close = true;
+        Err(CommonError::illegal_data())
     }
 }
 
 #[cfg(test)]
 mod test {
-    use super::Network;
+    use std::sync::Arc;
+
+    use tokio::{sync::Mutex, task::JoinError};
+
+    use crate::core::error::CommonError;
+
+    use super::{Network, NetworkState};
 
     #[tokio::test]
-    async fn test() {
+    async fn test_resolve() -> Result<(), CommonError> {
         let mut network = Network::new();
-        network.observer.connected.on(
-            |_| {
-                println!("Connected");
-            },
-            false,
+        let (addr, port) = network.resolve().await?;
+        let socket_addr = (addr.to_string(), port);
+
+        assert_ne!(network.server_list.len(), 0);
+        assert_eq!(
+            socket_addr,
+            network
+                .server_list
+                .first()
+                .and_then(|(addr, port)| Some((addr.to_string(), *port)))
+                .unwrap()
         );
-        let _ = network.connect().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test() -> Result<(), JoinError> {
+        let network = Arc::new(Mutex::new(Network::new()));
+
+        let mut rx = network.lock().await.on_state();
+        let cloned = Arc::clone(&network);
+        let handler = tokio::spawn(async move {
+            while let Ok((state, _)) = rx.recv().await {
+                match state {
+                    NetworkState::Closed => {
+                        println!("Closed");
+                        break;
+                    }
+                    NetworkState::Connecting => println!("Connecting"),
+                    NetworkState::Connected => {
+                        println!("Connected");
+                        cloned.lock().await.disconnect().await;
+                    }
+                }
+            }
+        });
+
+        let _ = network.lock().await.connect().await;
+        // drop(network);
+        let _ = handler.await;
+        Ok(())
     }
 }
