@@ -36,9 +36,11 @@ static UPDATE_SEVER_REQUEST: [(&str, [u8; 45]); 1] = [(
     ],
 )];
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkState {
     Closed,
+    ///若不是主动关闭连接，该状态则会在 [`NetworkState::Closed`] 后触发
+    Lost,
     Connecting,
     Connected,
 }
@@ -48,6 +50,7 @@ pub struct Network {
     tcp_writer: Arc<Mutex<Option<OwnedWriteHalf>>>,
     tcp_reader_handler: Option<JoinHandle<()>>,
     state: Arc<Mutex<NetworkState>>,
+    close_manually: Arc<Mutex<bool>>,
 
     server_last_update_time: Option<SystemTime>,
     server_list: Vec<(String, u16)>,
@@ -64,6 +67,7 @@ impl Network {
             tcp_writer: Arc::new(Mutex::new(None)),
             tcp_reader_handler: None,
             state: Arc::new(Mutex::new(NetworkState::Closed)),
+            close_manually: Arc::new(Mutex::new(false)),
 
             server_last_update_time: None,
             server_list: vec![],
@@ -92,43 +96,52 @@ impl Network {
     }
 
     pub async fn connect(&mut self) -> Result<(), CommonError> {
-        if let NetworkState::Closed = self.state().await {
+        let state = self.state().await;
+        if NetworkState::Closed == state {
+            *self.close_manually.lock().await = false;
+
             // 更新状态至 Connecting
             *self.state.lock().await = NetworkState::Connecting;
             self.state_tx.send((NetworkState::Connecting, None))?;
 
             // 使用尝试连接服务器
             let tcp = TcpStream::connect(self.resolve().await?).await?;
-
-            // 更新状态至 Connected
-            *self.state.lock().await = NetworkState::Connected;
-            self.state_tx
-                .send((NetworkState::Connected, tcp.peer_addr().ok()))?;
+            let target_server = tcp.peer_addr().ok();
 
             let (readable, writeable) = tcp.into_split();
             // 保留 tcp 写入流
             *self.tcp_writer.lock().await = Some(writeable);
             // 使用读取流持续读取内容
-            self.tcp_reader_handler = Some(self.read_packets(readable));
+            self.tcp_reader_handler = Some(self.describe_packets_receiving(readable));
+
+            // 更新状态至 Connected
+            *self.state.lock().await = NetworkState::Connected;
+            self.state_tx
+                .send((NetworkState::Connected, target_server))?;
 
             Ok(())
         } else {
-            Err(CommonError::from("connecting or connected"))
+            Err(CommonError::from("connected"))
         }
     }
 
-    pub async fn disconnect(&mut self) {
+    pub async fn disconnect(&mut self) -> Result<(), CommonError> {
         if let NetworkState::Connected = self.state().await {
+            *self.close_manually.lock().await = true;
+
             if let Some(mut stream) = self.tcp_writer.lock().await.take() {
                 let _ = stream.shutdown().await;
             }
             self.tcp_reader_handler = None;
 
             // Closed 事件会等待异步线程结束后触发
+            Ok(())
+        } else {
+            Err(CommonError::from("not connected"))
         }
     }
 
-    pub async fn write(&mut self, bytes: &[u8]) -> Result<(), CommonError> {
+    pub async fn send_bytes(&mut self, bytes: &[u8]) -> Result<(), CommonError> {
         if let NetworkState::Connected = self.state().await {
             let mut writer = self.tcp_writer.lock().await;
             let writer = writer.borrow_mut().as_mut().unwrap();
@@ -169,8 +182,9 @@ impl Network {
         Ok(target_server)
     }
 
-    fn read_packets(&mut self, mut reader: OwnedReadHalf) -> JoinHandle<()> {
+    fn describe_packets_receiving(&mut self, mut reader: OwnedReadHalf) -> JoinHandle<()> {
         let state = Arc::clone(&self.state);
+        let close_manually = Arc::clone(&self.close_manually);
         let packet_tx = self.packet_tx.clone();
         let state_tx = self.state_tx.clone();
         let error_tx = self.error_tx.clone();
@@ -225,9 +239,12 @@ impl Network {
             }
 
             *state.lock().await = NetworkState::Closed;
-            state_tx
-                .send((NetworkState::Closed, remote_addr))
-                .unwrap();
+            state_tx.send((NetworkState::Closed, remote_addr)).unwrap();
+
+            if !*close_manually.lock().await {
+                *state.lock().await = NetworkState::Lost;
+                state_tx.send((NetworkState::Lost, remote_addr)).unwrap();
+            }
         })
     }
 }
@@ -277,7 +294,8 @@ async fn update_server_list() -> Result<Vec<(String, u16)>, CommonError> {
                         let address =
                             String::try_from(ele.remove(&1).ok_or(CommonError::illegal_data())?)?;
                         let port =
-                            i16::try_from(ele.remove(&2).ok_or(CommonError::illegal_data())?)? as u16;
+                            i16::try_from(ele.remove(&2).ok_or(CommonError::illegal_data())?)?
+                                as u16;
 
                         list.push((address, port));
                         Ok(())
@@ -335,10 +353,16 @@ mod test {
                         println!("Closed");
                         break;
                     }
-                    NetworkState::Connecting => println!("Connecting"),
+                    NetworkState::Lost => {
+                        println!("Closed");
+                        break;
+                    }
+                    NetworkState::Connecting => {
+                        println!("Connecting");
+                    }
                     NetworkState::Connected => {
                         println!("Connected");
-                        cloned.lock().await.disconnect().await;
+                        let _ = cloned.lock().await.disconnect().await;
                     }
                 }
             }

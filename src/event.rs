@@ -2,6 +2,7 @@
 macro_rules! define_observer {
     ($name:ident, $(($event_name:ident, $container_name:ident, ($($y_name:ident: $y:ty),*))),+) => {
         $(
+            /// 注意！这是一个单线程的监听者模型，线程不安全！
             pub struct $container_name(Vec<Box<(bool, Box<dyn FnMut($($y),*) + 'static>)>>);
 
             impl $container_name {
@@ -56,6 +57,7 @@ macro_rules! define_observer {
             }
         )+
 
+        /// 注意！这是一个单线程的监听者模型，线程不安全！
         #[derive(Debug)]
         pub struct $name {
             $(pub $event_name: $container_name),+,

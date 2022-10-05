@@ -6,10 +6,7 @@ use std::{
     string::FromUtf8Error,
 };
 
-use super::writer::{
-    write_bytes, write_f32, write_f64, write_i16, write_i32, write_i64, write_i8, write_u32,
-    write_u8,
-};
+use super::io::WriteExt;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Type {
@@ -610,9 +607,9 @@ where
 {
     let r#type = r#type as u8;
     if tag < 15 {
-        write_bytes(stream, &[(tag << 4) | r#type])?;
+        stream.write_bytes([(tag << 4) | r#type])?;
     } else {
-        write_bytes(stream, &[0xf0 | r#type, tag])?;
+        stream.write_bytes([0xf0 | r#type, tag])?;
     }
 
     Ok(())
@@ -624,24 +621,24 @@ where
 {
     match body {
         JceElement::Zero => {}
-        JceElement::Int8(value) => write_i8(stream, *value)?,
-        JceElement::Int16(value) => write_i16(stream, *value)?,
-        JceElement::Int32(value) => write_i32(stream, *value)?,
-        JceElement::Int64(value) => write_i64(stream, *value)?,
-        JceElement::Float(value) => write_f32(stream, *value)?,
-        JceElement::Double(value) => write_f64(stream, *value)?,
+        JceElement::Int8(value) => stream.write_i8(*value)?,
+        JceElement::Int16(value) => stream.write_i16(*value)?,
+        JceElement::Int32(value) => stream.write_i32(*value)?,
+        JceElement::Int64(value) => stream.write_i64(*value)?,
+        JceElement::Float(value) => stream.write_f32(*value)?,
+        JceElement::Double(value) => stream.write_f64(*value)?,
         JceElement::String1(value) => {
-            write_u8(stream, value.len() as u8)?;
-            write_bytes(stream, value)?;
+            stream.write_u8(value.len() as u8)?;
+            stream.write_bytes(value)?;
         }
         JceElement::String4(value) => {
-            write_u32(stream, value.len() as u32)?;
-            write_bytes(stream, value)?;
+            stream.write_u32(value.len() as u32)?;
+            stream.write_bytes(value)?;
         }
         JceElement::SimpleList(value) => {
             create_head(stream, 0, Type::Int8)?; // 仅占位，没有实际意义
             create_element(stream, 0, &JceElement::from(value.len() as i64))?;
-            write_bytes(stream, value)?
+            stream.write_bytes(value)?
         }
         JceElement::List(value) => {
             create_element(stream, 0, &JceElement::from(value.len() as i64))?;

@@ -6,6 +6,6 @@ pub mod tea;
 pub mod ecdh;
 pub mod tlv;
 pub mod device;
-pub mod writer;
+pub mod io;
 pub mod protobuf;
 pub mod error;

@@ -1,4 +1,8 @@
-use p256::{ecdh::EphemeralSecret, elliptic_curve::rand_core::OsRng, PublicKey};
+use p256::{
+    ecdh::EphemeralSecret,
+    elliptic_curve::{rand_core::OsRng, sec1::ToEncodedPoint},
+    PublicKey,
+};
 
 static OICQ_PUBLIC_KEY: [u8; 65] = [
     0x04, 0xeb, 0xca, 0x94, 0xd7, 0x33, 0xe3, 0x99, 0xb2, 0xdb, 0x96, 0xea, 0xcd, 0xd3, 0xf6, 0x9a,
@@ -8,10 +12,27 @@ static OICQ_PUBLIC_KEY: [u8; 65] = [
     0x2e,
 ];
 
-pub fn create_ecdh() -> [u8; 16] {
-    let key_pair = EphemeralSecret::random(&mut OsRng);
-    let share_key = key_pair.diffie_hellman(&PublicKey::from_sec1_bytes(&OICQ_PUBLIC_KEY).unwrap());
-    let share_key = md5::compute(&share_key.raw_secret_bytes()[..16]).0;
+#[derive(Debug)]
+pub struct ECDH {
+    pub share_key: [u8; 16],
+    pub public_key: Vec<u8>,
+}
 
-    share_key
+impl ECDH {
+    pub fn new() -> Self {
+        let key_pair = EphemeralSecret::random(&mut OsRng);
+        let share_key =
+            key_pair.diffie_hellman(&PublicKey::from_sec1_bytes(&OICQ_PUBLIC_KEY).unwrap());
+        let share_key = md5::compute(&share_key.raw_secret_bytes()[..16]).0;
+
+        Self {
+            share_key,
+            public_key: key_pair
+                .public_key()
+                .as_affine()
+                .to_encoded_point(false)
+                .as_bytes()
+                .to_vec(),
+        }
+    }
 }

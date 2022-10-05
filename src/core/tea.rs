@@ -1,5 +1,7 @@
 use std::io::{Read, Write};
 
+use p256::elliptic_curve::consts::U8;
+
 use super::{constant::BUF_7, error::CommonError};
 
 static DELTAS: [u32; 16] = [
@@ -28,18 +30,17 @@ fn encrypt_part(mut x: u32, mut y: u32, k0: u32, k1: u32, k2: u32, k3: u32) -> (
     (x, y)
 }
 
-pub fn encrypt<T, R>(data: R, key: &[u8; 16]) -> Result<Vec<u8>, CommonError>
+pub fn encrypt<T>(data: T, key: &[u8; 16]) -> Result<Vec<u8>, CommonError>
 where
-    T: Iterator<Item = u8> + ExactSizeIterator,
-    R: IntoIterator<Item = u8, IntoIter = T>,
+    T: AsRef<[u8]>,
 {
-    let iter = data.into_iter();
-    let len = iter.len() as u32;
+    let data = data.as_ref();
+    let len = data.len() as u32;
     let n = (6u32.wrapping_sub(len) % 8) + 2;
     let mut v = Vec::<u8>::with_capacity((1 + n + len) as usize + BUF_7.len());
     v.extend([(n as u8 - 2) | 0xf8]);
     v.extend(vec![0; n as usize]);
-    v.extend(iter);
+    v.extend(data);
     v.extend(BUF_7);
 
     let mut encrypted = Vec::<u8>::with_capacity(v.len());
