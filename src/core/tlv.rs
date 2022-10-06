@@ -1,14 +1,10 @@
 use std::{
     io::Write,
-    marker::PhantomPinned,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use async_recursion::async_recursion;
-use pin_project_lite::pin_project;
-
 use super::{
-    base_client::BaseClient,
+    base_client::BaseClientData,
     constant::{BUF_0, BUF_1},
     device::Platform,
     error::CommonError,
@@ -24,9 +20,9 @@ fn current_timestamp() -> u128 {
         .as_millis()
 }
 
-async fn pack_body<W: Write>(
+ fn pack_body<W: Write>(
     writer: &mut W,
-    base_client: &BaseClient,
+    base_client: &BaseClientData,
     tag: u16,
     emp: Option<u32>,
     md5pass: Option<Vec<u8>>,
@@ -121,7 +117,7 @@ async fn pack_body<W: Write>(
             Ok(())
         }
         0x104 => {
-            writer.write_bytes(base_client.sig().await.t104)?;
+            writer.write_bytes(base_client.sig().t104)?;
             Ok(())
         }
         0x106 => {
@@ -137,7 +133,7 @@ async fn pack_body<W: Write>(
             body.write_bytes([0; 4])?;
             body.write_u8(1)?;
             body.write_bytes(&md5pass)?;
-            body.write_bytes(base_client.sig().await.tgtgt)?;
+            body.write_bytes(base_client.sig().tgtgt)?;
             body.write_u32(0)?;
             body.write_u8(1)?;
             body.write_bytes(base_client.device().guid)?;
@@ -168,7 +164,7 @@ async fn pack_body<W: Write>(
             Ok(())
         }
         0x10a => {
-            writer.write_bytes(base_client.sig().await.tgt)?;
+            writer.write_bytes(base_client.sig().tgt)?;
             Ok(())
         }
         0x116 => {
@@ -212,19 +208,19 @@ async fn pack_body<W: Write>(
             Ok(())
         }
         0x143 => {
-            writer.write_bytes(base_client.sig().await.d2)?;
+            writer.write_bytes(base_client.sig().d2)?;
             Ok(())
         }
         0x144 => {
             let mut body = Vec::with_capacity(200);
             body.write_u16(5)?;
-            body.write_bytes(pack_tlv(base_client, 0x109).await?)?;
-            body.write_bytes(pack_tlv(base_client, 0x52d).await?)?;
-            body.write_bytes(pack_tlv(base_client, 0x124).await?)?;
-            body.write_bytes(pack_tlv(base_client, 0x128).await?)?;
-            body.write_bytes(pack_tlv(base_client, 0x16e).await?)?;
+            body.write_bytes(pack_tlv(base_client, 0x109)?)?;
+            body.write_bytes(pack_tlv(base_client, 0x52d)?)?;
+            body.write_bytes(pack_tlv(base_client, 0x124)?)?;
+            body.write_bytes(pack_tlv(base_client, 0x128)?)?;
+            body.write_bytes(pack_tlv(base_client, 0x16e)?)?;
 
-            writer.write_bytes(encrypt(body, &base_client.sig().await.tgtgt)?)?;
+            writer.write_bytes(encrypt(body, &base_client.sig().tgtgt)?)?;
             Ok(())
         }
         0x145 => {
@@ -238,7 +234,7 @@ async fn pack_body<W: Write>(
             Ok(())
         }
         0x154 => {
-            writer.write_u32(base_client.sig().await.seq + 1)?;
+            writer.write_u32(base_client.sig().seq + 1)?;
             Ok(())
         }
         0x16e => {
@@ -246,7 +242,7 @@ async fn pack_body<W: Write>(
             Ok(())
         }
         0x174 => {
-            writer.write_bytes(base_client.sig().await.t174)?;
+            writer.write_bytes(base_client.sig().t174)?;
             Ok(())
         }
         0x177 => {
@@ -375,10 +371,9 @@ async fn pack_body<W: Write>(
     }
 }
 
-#[async_recursion]
-pub async fn pack_tlv(base_client: &BaseClient, tag: u16) -> Result<Vec<u8>, CommonError> {
+pub  fn pack_tlv(base_client: &BaseClientData, tag: u16) -> Result<Vec<u8>, CommonError> {
     let mut body = Vec::with_capacity(200);
-    pack_body(&mut body, base_client, tag, None, None, None, None).await?;
+    pack_body(&mut body, base_client, tag, None, None, None, None)?;
     let len = body.len();
     body.write_u16(len as u16)?;
     body.write_u16(tag)?;

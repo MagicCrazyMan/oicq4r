@@ -1,7 +1,5 @@
 use std::io::{Read, Write};
 
-use p256::elliptic_curve::consts::U8;
-
 use super::{constant::BUF_7, error::CommonError};
 
 static DELTAS: [u32; 16] = [

@@ -5,7 +5,7 @@ use std::{
     io::{Read, Write},
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Weak, atomic::{AtomicBool, Ordering}},
     task::{Context, Poll},
     time::{Duration, SystemTime},
 };
@@ -113,15 +113,15 @@ impl SIG {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Statistics {
-    pub start_time: SystemTime,
-    pub lost_times: usize,
-    pub recv_pkt_cnt: usize,
-    pub sent_pkt_cnt: usize,
-    pub lost_pkt_cnt: usize,
-    pub recv_msg_cnt: usize,
-    pub sent_msg_cnt: usize,
-    pub msg_cnt_per_min: usize,
-    pub remote_socket_addr: Option<SocketAddr>,
+    lost_pkt_cnt: usize,
+    lost_times: usize,
+    msg_cnt_per_min: usize,
+    recv_msg_cnt: usize,
+    recv_pkt_cnt: usize,
+    remote_socket_addr: Option<SocketAddr>,
+    sent_msg_cnt: usize,
+    sent_pkt_cnt: usize,
+    start_time: SystemTime,
 }
 
 impl Statistics {
@@ -137,6 +137,44 @@ impl Statistics {
             msg_cnt_per_min: 0,
             remote_socket_addr: None,
         }
+    }
+}
+
+impl Statistics {
+    pub fn lost_pkt_cnt(&self) -> usize {
+        self.lost_pkt_cnt
+    }
+
+    pub fn lost_times(&self) -> usize {
+        self.lost_times
+    }
+
+    pub fn msg_cnt_per_min(&self) -> usize {
+        self.msg_cnt_per_min
+    }
+
+    pub fn recv_msg_cnt(&self) -> usize {
+        self.recv_msg_cnt
+    }
+
+    pub fn recv_pkt_cnt(&self) -> usize {
+        self.recv_pkt_cnt
+    }
+
+    pub fn remote_socket_addr(&self) -> Option<SocketAddr> {
+        self.remote_socket_addr
+    }
+
+    pub fn sent_msg_cnt(&self) -> usize {
+        self.sent_msg_cnt
+    }
+
+    pub fn sent_pkt_cnt(&self) -> usize {
+        self.sent_pkt_cnt
+    }
+
+    pub fn start_time(&self) -> SystemTime {
+        self.start_time
     }
 }
 
@@ -245,77 +283,44 @@ impl Future for Request {
 }
 
 #[derive(Debug)]
-pub struct BaseClient {
-    network: Network,
-    statistics: Arc<Mutex<Statistics>>,
-
+pub struct BaseClientData {
+    statistics: Statistics,
     uin: u32,
     apk: APK,
     device: FullDevice,
-    sig: Arc<Mutex<SIG>>,
+    sig: SIG,
     ecdh: ECDH,
 
-    registered: Arc<Mutex<bool>>,
+    registered: Arc<AtomicBool>,
 
-    subscribed_handlers: Vec<JoinHandle<()>>,
+    network: Network,
+    polling_requests: HashMap<u32, Weak<Mutex<Option<Vec<u8>>>>>,
     heartbeat_handler: Option<JoinHandle<()>>,
-    polling_requests: Arc<Mutex<HashMap<u32, Arc<Mutex<Option<Vec<u8>>>>>>>,
-
-    verbose_tx: Sender<(String, Level)>,
-    error_tx: Sender<InternalErrorKind>,
-    sso_tx: Sender<(u32, String, Vec<u8>)>,
 }
 
-impl BaseClient {
-    pub fn new(uin: u32, platform: Platform, d: Option<ShortDevice>) -> Self {
-        let mut instance = Self {
+impl BaseClientData {
+    fn new(uin: u32, platform: Platform, d: Option<ShortDevice>) -> Self {
+        Self {
             network: Network::new(),
-            statistics: Arc::new(Mutex::new(Statistics::new())),
+            statistics: Statistics::new(),
 
             uin,
             apk: platform.metadata(),
             device: FullDevice::from(d.unwrap_or(ShortDevice::generate(uin))),
-            sig: Arc::new(Mutex::new(SIG::new(uin))),
+            sig: SIG::new(uin),
             ecdh: ECDH::new(),
 
-            registered: Arc::new(Mutex::new(false)),
+            registered: Arc::new(AtomicBool::new(false)),
 
-            subscribed_handlers: Vec::with_capacity(3),
             heartbeat_handler: None,
-            polling_requests: Arc::new(Mutex::new(HashMap::new())),
-
-            verbose_tx: sync::broadcast::channel(1).0,
-            error_tx: sync::broadcast::channel(1).0,
-            sso_tx: sync::broadcast::channel(1).0,
-        };
-
-        instance.describe_network_error();
-        instance.describe_network_state();
-        instance.describe_network_packet();
-
-        instance
-    }
-
-    pub fn default(uin: u32) -> Self {
-        Self::new(uin, Platform::Android, None)
+            polling_requests: HashMap::new(),
+        }
     }
 }
 
-impl BaseClient {
-    pub fn on_verbose(&self) -> Receiver<(String, Level)> {
-        self.verbose_tx.subscribe()
-    }
-
-    pub fn on_error(&self) -> Receiver<InternalErrorKind> {
-        self.error_tx.subscribe()
-    }
-
-    pub fn on_sso(&self) -> Receiver<(u32, String, Vec<u8>)> {
-        self.sso_tx.subscribe()
-    }
-
+impl BaseClientData {
     pub async fn register(&mut self) {
-        *self.registered.lock().await = false;
+        self.registered.store(false, Ordering::Relaxed);
     }
 
     // pub async fn connect(&mut self) -> Result<(), CommonError> {
@@ -327,7 +332,7 @@ impl BaseClient {
     // }
 }
 
-impl BaseClient {
+impl BaseClientData {
     async fn heartbeat(&mut self) {
         // 如果存在一个已有的异步线程，首先关闭
         if let Some(handler) = self.heartbeat_handler.take() {
@@ -337,7 +342,7 @@ impl BaseClient {
 
         let registered = Arc::clone(&self.registered);
         self.heartbeat_handler = Some(tokio::spawn(async move {
-            while *registered.lock().await {
+            while registered.load(Ordering::Relaxed) {
                 todo!()
             }
         }));
@@ -356,7 +361,7 @@ impl BaseClient {
         let response_packet = &mut response_packet.as_slice();
         // 此处忽略错误
         if let Ok(server_time) = response_packet.read_i32() {
-            self.sig().await.time_diff = server_time as i64
+            self.sig.time_diff = server_time as i64
                 - SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)?
                     .as_secs() as i64;
@@ -376,10 +381,10 @@ impl BaseClient {
     {
         self.increase_seq().await;
 
-        let _ = self.verbose_tx.send((
-            format!("send: {} seq: {}", command.as_ref(), self.sig().await.seq),
-            Level::Debug,
-        ));
+        // let _ = self.verbose_tx.send((
+        //     format!("send: {} seq: {}", command.as_ref(), self.sig().await.seq),
+        //     Level::Debug,
+        // ));
 
         let r#type = r#type.unwrap_or(LoginCommandType::Type2);
         let (uin, cmd_id, subid) = match command {
@@ -395,7 +400,7 @@ impl BaseClient {
                     Vec::with_capacity(24 + self.ecdh.public_key.len() + encrypted.len());
                 buf_0.write_u8(0x02)?;
                 buf_0.write_u8(0x01)?;
-                buf_0.write_all(&self.sig().await.randkey)?;
+                buf_0.write_all(&self.sig.randkey)?;
                 buf_0.write_u16(0x131)?;
                 buf_0.write_u16(0x01)?;
                 buf_0.write_u16(0x01)?;
@@ -425,15 +430,15 @@ impl BaseClient {
 
         let mut buf =
             Vec::with_capacity(54 + command.as_ref().len() + self.device().imei.as_str().len());
-        buf.write_u32(self.sig().await.seq)?;
+        buf.write_u32(self.sig.seq)?;
         buf.write_u32(subid)?;
         buf.write_u32(subid)?;
         buf.write_bytes([
             0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
         ])?;
-        buf.write_bytes_with_length(self.sig().await.tgt)?;
+        buf.write_bytes_with_length(self.sig.tgt)?;
         buf.write_bytes_with_length(command.as_ref())?;
-        buf.write_bytes_with_length(self.sig().await.session)?;
+        buf.write_bytes_with_length(self.sig.session)?;
         buf.write_bytes_with_length(self.device().imei.as_str())?;
         buf.write_u32(4)?;
         buf.write_u16(2)?;
@@ -443,7 +448,7 @@ impl BaseClient {
         sso.write_bytes_with_length(body)?;
 
         let encrypted_sso = match r#type {
-            LoginCommandType::Type1 => tea::encrypt(sso, &self.sig().await.d2key)?,
+            LoginCommandType::Type1 => tea::encrypt(sso, &self.sig.d2key)?,
             LoginCommandType::Type2 => tea::encrypt(sso, &BUF_16)?,
             _ => sso,
         };
@@ -451,7 +456,7 @@ impl BaseClient {
         let mut packet = Vec::with_capacity(100);
         packet.write_u32(0x0A)?;
         packet.write_u8(r#type as u8)?;
-        packet.write_bytes_with_length(self.sig().await.d2)?;
+        packet.write_bytes_with_length(self.sig.d2)?;
         packet.write_u8(0)?;
         packet.write_bytes_with_length(uin.to_string())?;
         packet.write_bytes(encrypted_sso)?;
@@ -462,13 +467,12 @@ impl BaseClient {
     }
 
     async fn increase_seq(&mut self) {
-        let mut sig = self.sig().await;
-        let mut next = sig.seq + 1;
+        let mut next = self.sig.seq + 1;
         if next >= 0x8000 {
             next = 0
         }
 
-        sig.seq = next;
+        self.sig.seq = next;
     }
 
     /// 超时默认为 5s，如果需要自定义超时，请使用 `send_request_with_timeout`
@@ -488,17 +492,24 @@ impl BaseClient {
             start: Instant::now(),
             packet: Arc::new(Mutex::new(None)),
         };
-        let packet = Arc::clone(&request.packet);
-        self.polling_requests
-            .lock()
-            .await
-            .insert(self.sig().await.seq, packet);
-
+        let packet = Arc::downgrade(&request.packet);
+        self.polling_requests.insert(self.sig.seq, packet);
         self.network.send_bytes(payload.as_ref()).await?;
 
-        self.statistics().await.sent_pkt_cnt += 1;
+        self.statistics.sent_pkt_cnt += 1;
 
         Ok(request)
+    }
+
+    async fn update_request(&mut self, seq: u32, receive_packet: Vec<u8>) -> Option<Vec<u8>> {
+        if let Some(request) = self.polling_requests.remove(&seq) {
+            if let Some(request) = request.upgrade() {
+                *request.lock().await = Some(receive_packet);
+                return None;
+            }
+        }
+
+        Some(receive_packet)
     }
 
     // async fn send_request_with_timeout(&mut self, payload: &[u8]) -> Result<Request, CommonError> {
@@ -565,10 +576,90 @@ impl BaseClient {
     }
 }
 
+impl BaseClientData {
+    pub fn uin(&self) -> u32 {
+        self.uin
+    }
+
+    pub fn apk(&self) -> APK {
+        self.apk
+    }
+
+    pub fn device(&self) -> &FullDevice {
+        &self.device
+    }
+
+    pub fn sig(&self) -> &SIG {
+        &self.sig
+    }
+
+    pub fn ecdh(&self) -> &ECDH {
+        &self.ecdh
+    }
+
+    pub fn statistics(&self) -> &Statistics {
+        &self.statistics
+    }
+}
+
+#[derive(Debug)]
+pub struct BaseClient {
+    inner: Arc<Mutex<BaseClientData>>,
+
+    subscribed_handlers: Vec<JoinHandle<()>>,
+
+    verbose_tx: Sender<(String, Level)>,
+    error_tx: Sender<InternalErrorKind>,
+    sso_tx: Sender<(u32, String, Vec<u8>)>,
+}
+
 impl BaseClient {
-    fn describe_network_error(&mut self) {
-        let mut rx = self.network.on_error();
+    pub async fn new(uin: u32, platform: Platform, d: Option<ShortDevice>) -> Self {
+        let mut instance = Self {
+            inner: Arc::new(Mutex::new(BaseClientData::new(uin, platform, d))),
+
+            subscribed_handlers: Vec::with_capacity(3),
+
+            verbose_tx: sync::broadcast::channel(1).0,
+            error_tx: sync::broadcast::channel(1).0,
+            sso_tx: sync::broadcast::channel(1).0,
+        };
+
+        instance.describe_network_error().await;
+        instance.describe_network_state().await;
+        instance.describe_network_packet().await;
+
+        instance
+    }
+
+    pub async fn default(uin: u32) -> Self {
+        Self::new(uin, Platform::Android, None).await
+    }
+}
+
+impl BaseClient {
+    pub async fn inner(&self) -> MutexGuard<BaseClientData> {
+        self.inner.lock().await
+    }
+
+    pub fn on_verbose(&self) -> Receiver<(String, Level)> {
+        self.verbose_tx.subscribe()
+    }
+
+    pub fn on_error(&self) -> Receiver<InternalErrorKind> {
+        self.error_tx.subscribe()
+    }
+
+    pub fn on_sso(&self) -> Receiver<(u32, String, Vec<u8>)> {
+        self.sso_tx.subscribe()
+    }
+}
+
+impl BaseClient {
+    async fn describe_network_error(&mut self) {
+        let mut rx = self.inner().await.network.on_error();
         let verbose_tx = self.verbose_tx.clone();
+
         self.subscribed_handlers.push(tokio::spawn(async move {
             while let Ok(err) = rx.recv().await {
                 let _ = verbose_tx.send((err.to_string(), Level::Error));
@@ -576,15 +667,16 @@ impl BaseClient {
         }));
     }
 
-    fn describe_network_state(&mut self) {
-        let statistics = Arc::clone(&self.statistics);
-        let mut rx = self.network.on_state();
+    async fn describe_network_state(&mut self) {
+        let this = Arc::clone(&self.inner);
+        let mut rx = self.inner().await.network.on_state();
         let verbose_tx = self.verbose_tx.clone();
+
         self.subscribed_handlers.push(tokio::spawn(async move {
             while let Ok((state, socket_addr)) = rx.recv().await {
                 let _ = match state {
                     NetworkState::Closed => {
-                        statistics.lock().await.remote_socket_addr = None;
+                        this.lock().await.statistics.remote_socket_addr = None;
 
                         verbose_tx.send((
                             format!(
@@ -597,7 +689,7 @@ impl BaseClient {
                         ))
                     }
                     NetworkState::Lost => {
-                        statistics.lock().await.lost_times += 1;
+                        this.lock().await.statistics.lost_times += 1;
 
                         verbose_tx.send((
                             format!(
@@ -613,7 +705,7 @@ impl BaseClient {
                         verbose_tx.send((format!("network connecting..."), Level::Info))
                     }
                     NetworkState::Connected => {
-                        statistics.lock().await.remote_socket_addr = socket_addr.clone();
+                        this.lock().await.statistics.remote_socket_addr = socket_addr.clone();
 
                         verbose_tx.send((
                             format!(
@@ -630,19 +722,17 @@ impl BaseClient {
         }));
     }
 
-    fn describe_network_packet(&mut self) {
-        let statistics = Arc::clone(&self.statistics);
-        let sig = Arc::clone(&self.sig);
-        let polling_requests = Arc::clone(&self.polling_requests);
+    async fn describe_network_packet(&mut self) {
+        let this = Arc::clone(&self.inner);
 
-        let mut rx = self.network.on_packet();
+        let mut rx = self.inner().await.network.on_packet();
         let error_tx = self.error_tx.clone();
         let verbose_tx = self.verbose_tx.clone();
         let sso_tx = self.sso_tx.clone();
         self.subscribed_handlers.push(tokio::spawn(async move {
             let mut z_decompress = Decompress::new(true);
             while let Ok(packet) = rx.recv().await {
-                statistics.lock().await.recv_pkt_cnt += 1;
+                this.lock().await.statistics.recv_pkt_cnt += 1;
 
                 let flag = packet[4];
                 let offset = u32::from_be_bytes(packet[6..10].try_into().unwrap());
@@ -650,7 +740,7 @@ impl BaseClient {
 
                 let decrypted = match flag {
                     0 => encrypted,
-                    1 => match decrypt(&encrypted, &sig.lock().await.d2key) {
+                    1 => match decrypt(&encrypted, &this.lock().await.sig.d2key) {
                         Ok(decrypted) => decrypted,
                         Err(err) => {
                             let _ = verbose_tx.send((
@@ -677,15 +767,13 @@ impl BaseClient {
                     }
                 };
 
-                match BaseClient::parse_sso(decrypted.as_slice(), &mut z_decompress) {
+                match BaseClientData::parse_sso(decrypted.as_slice(), &mut z_decompress) {
                     Ok(sso) => {
                         let _ = verbose_tx
                             .send((format!("recv: {} seq: {}", sso.0, sso.1), Level::Debug));
 
-                        if let Some(packet) = polling_requests.lock().await.remove(&sso.0) {
-                            *packet.lock().await = Some(sso.2)
-                        } else {
-                            let _ = sso_tx.send(sso);
+                        if let Some(packet) = this.lock().await.update_request(sso.0, sso.2).await {
+                            let _ = sso_tx.send((sso.0, sso.1, packet));
                         }
                     }
                     Err(err) => {
@@ -698,28 +786,6 @@ impl BaseClient {
     }
 }
 
-impl BaseClient {
-    pub fn uin(&self) -> u32 {
-        self.uin
-    }
-
-    pub fn device(&self) -> &FullDevice {
-        &self.device
-    }
-
-    pub fn apk(&self) -> APK {
-        self.apk
-    }
-
-    pub async fn sig(&self) -> MutexGuard<SIG> {
-        self.sig.lock().await
-    }
-
-    pub async fn statistics(&self) -> MutexGuard<Statistics> {
-        self.statistics.lock().await
-    }
-}
-
 #[cfg(test)]
 mod test {
     use std::time::Duration;
@@ -728,7 +794,7 @@ mod test {
 
     #[tokio::test]
     async fn test() {
-        let mut base_client = BaseClient::default(1313);
+        let mut base_client = BaseClient::default(1313).await;
 
         let mut rx = base_client.on_verbose();
         let handler = tokio::spawn(async move {
