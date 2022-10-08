@@ -558,8 +558,7 @@ impl BaseClientData {
 
     fn decode_login_response<B: AsRef<[u8]>>(&mut self, payload: B ) -> Result<(), CommonError> {
         let decrypted = tea::decrypt(&mut &payload.as_ref()[16..], &self.ecdh.share_key)?;
-
-        let r#type = decrypted[2];
+        
         todo!()
     }
 }
@@ -733,7 +732,6 @@ struct Heartbeater {
     data: Arc<Mutex<BaseClientData>>,
     request_sender: RequestSender,
     verbose_tx: Sender<(String, Level)>,
-    token_tx: Sender<Vec<u8>>,
 }
 
 impl Heartbeater {
@@ -741,14 +739,12 @@ impl Heartbeater {
         data: Arc<Mutex<BaseClientData>>,
         request_sender: RequestSender,
         verbose_tx: Sender<(String, Level)>,
-        token_tx: Sender<Vec<u8>>,
     ) -> Self {
         Self {
             retried: 0,
             data,
             request_sender,
             verbose_tx,
-            token_tx,
         }
     }
 
@@ -813,8 +809,6 @@ impl Heartbeater {
                 .get(&0x119)
                 .ok_or(CommonError::new("tag 0x119 not existed"))?;
             let user = self.data.lock().await.decode_t119(t119)?;
-            
-            self.token_tx.send(user.token);
 
             todo!()
         }
@@ -871,7 +865,6 @@ pub struct BaseClient {
     verbose_tx: Sender<(String, Level)>,
     error_tx: Sender<InternalErrorKind>,
     sso_tx: Sender<(u32, String, Vec<u8>)>,
-    token_tx: Sender<String>,
 }
 
 impl BaseClient {
@@ -887,7 +880,6 @@ impl BaseClient {
             verbose_tx: sync::broadcast::channel(1).0,
             error_tx: sync::broadcast::channel(1).0,
             sso_tx: sync::broadcast::channel(1).0,
-            token_tx: sync::broadcast::channel(1).0,
         };
 
         instance.describe_network_error().await;
@@ -1116,13 +1108,131 @@ impl BaseClient {
     }
 }
 
-impl BaseClient {pub async fn register(
-    &mut self,
-    logout: Option<bool>,
-    refresh: Option<bool>,
-) -> Result<(), CommonError> { 
+impl BaseClient {
+    pub async fn register(
+        &mut self,
+        logout: Option<bool>,
+        refresh: Option<bool>,
+    ) -> Result<(), CommonError> {
+        let logout = logout.unwrap_or(false);
+        let refresh = refresh.unwrap_or(false);
 
-}
+        self.registered.store(false, Ordering::Relaxed);
+        self.stop_heartbeat().await;
+
+        let pb_buf = protobuf::encode(&ProtobufObject::from([(
+            1,
+            ProtobufElement::from([
+                ProtobufElement::Object(ProtobufObject::from([
+                    (1, ProtobufElement::from(46)),
+                    (
+                        2,
+                        ProtobufElement::from(current_unix_timestamp_as_secs() as i64),
+                    ),
+                ])),
+                ProtobufElement::Object(ProtobufObject::from([
+                    (1, ProtobufElement::from(283)),
+                    (2, ProtobufElement::from(0)),
+                ])),
+            ]),
+        )]))?;
+
+        let data = self.data().await;
+        let d = &data.device;
+        let svc_req_register = jce::encode(&JceObject::try_from([
+            Some(JceElement::from(data.uin as i64)),
+            Some(JceElement::from(logout.then_some(0).unwrap_or(7))),
+            Some(JceElement::from(0)),
+            Some(JceElement::from("")),
+            Some(JceElement::from(logout.then_some(21).unwrap_or(11))),
+            Some(JceElement::from(0)),
+            Some(JceElement::from(0)),
+            Some(JceElement::from(0)),
+            Some(JceElement::from(0)),
+            Some(JceElement::from(0)),
+            Some(JceElement::from(logout.then_some(44).unwrap_or(0))),
+            Some(JceElement::from(d.version.sdk as i64)),
+            Some(JceElement::from(1)),
+            Some(JceElement::from("")),
+            Some(JceElement::from(0)),
+            None,
+            Some(JceElement::from(d.guid)),
+            Some(JceElement::from(2052)),
+            Some(JceElement::from(0)),
+            Some(JceElement::from(d.model)),
+            Some(JceElement::from(d.model)),
+            Some(JceElement::from(d.version.release)),
+            Some(JceElement::from(1)),
+            Some(JceElement::from(0)),
+            Some(JceElement::from(0)),
+            None,
+            Some(JceElement::from(0)),
+            Some(JceElement::from(0)),
+            Some(JceElement::from("")),
+            Some(JceElement::from(0)),
+            Some(JceElement::from(d.brand)),
+            Some(JceElement::from(d.brand)),
+            Some(JceElement::from("")),
+            Some(JceElement::from(pb_buf)),
+            Some(JceElement::from(0)),
+            None,
+            Some(JceElement::from(0)),
+            None,
+            Some(JceElement::from(1000)),
+            Some(JceElement::from(98)),
+        ])?)?;
+        let body = jce::encode_wrapper(
+            [("SvcReqRegister", svc_req_register)],
+            "PushService",
+            "SvcReqRegister",
+            None,
+        )?;
+        drop(data);
+
+        let pkt = self.data().await.build_common_packet(
+            Command::StatSvcRegister,
+            body,
+            Some(CommandType::Type1),
+        )?;
+
+        let mut request_sender = RequestSender::from(self.as_ref());
+        if logout {
+            request_sender.write_request(pkt).await?;
+
+            Ok(())
+        } else {
+            let request = request_sender
+                .send_request(pkt, Some(Duration::from_secs(10)))
+                .await?;
+            let response = request.await?;
+
+            let rsp = jce::decode_wrapper(&mut response.as_slice())?;
+            if let JceElement::StructBegin(value) = rsp {
+                let result = value
+                    .get(&9)
+                    .ok_or(CommonError::illegal_data())
+                    .and_then(|e| {
+                        if let JceElement::Int8(e) = e {
+                            Ok(e)
+                        } else {
+                            Err(CommonError::illegal_data())
+                        }
+                    })
+                    .and_then(|e| if *e != 0 { Ok(true) } else { Ok(false) })?;
+
+                if !result && !refresh {
+                    let _ = self.error_tx.send(InternalErrorKind::Token);
+                } else {
+                    self.registered.store(true, Ordering::Relaxed);
+                    self.start_heartbeat().await;
+                }
+
+                Ok(())
+            } else {
+                Err(CommonError::illegal_data())
+            }
+        }
+    }
 
     pub async fn connect(&mut self) -> Result<(), CommonError> {
         self.network.lock().await.connect().await
