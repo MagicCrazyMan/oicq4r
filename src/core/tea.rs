@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use super::{constant::BUF_7, error::CommonError};
+use super::{helper::BUF_7, error::CommonError};
 
 static DELTAS: [u32; 16] = [
     0x9e3779b9, 0x3c6ef372, 0xdaa66d2b, 0x78dde6e4, 0x1715609d, 0xb54cda56, 0x5384540f, 0xf1bbcdc8,
@@ -28,9 +28,9 @@ fn encrypt_part(mut x: u32, mut y: u32, k0: u32, k1: u32, k2: u32, k3: u32) -> (
     (x, y)
 }
 
-pub fn encrypt<T>(data: T, key: &[u8; 16]) -> Result<Vec<u8>, CommonError>
+pub fn encrypt<B>(data: B, key: &[u8; 16]) -> Result<Vec<u8>, CommonError>
 where
-    T: AsRef<[u8]>,
+    B: AsRef<[u8]>,
 {
     let data = data.as_ref();
     let len = data.len() as u32;
@@ -97,7 +97,11 @@ fn decrypt_part(mut x: u32, mut y: u32, k0: u32, k1: u32, k2: u32, k3: u32) -> (
     (x as u32, y as u32)
 }
 
-pub fn decrypt(encrypted: &Vec<u8>, key: &[u8; 16]) -> Result<Vec<u8>, CommonError> {
+pub fn decrypt<B>(encrypted: B, key: &[u8; 16]) -> Result<Vec<u8>, CommonError>
+where
+    B: AsRef<[u8]>,
+{
+    let encrypted = encrypted.as_ref();
     if encrypted.len() % 8 != 0 {
         return Err(CommonError::from(
             "length of encrypted data must be a multiple of 8",
@@ -118,7 +122,7 @@ pub fn decrypt(encrypted: &Vec<u8>, key: &[u8; 16]) -> Result<Vec<u8>, CommonErr
     let mut x = 0;
     let mut y = 0;
     let mut buf = [0; 4];
-    let raw = &mut encrypted.as_slice();
+    let raw = &mut &encrypted[..];
     for _ in (0..encrypted.len()).step_by(8) {
         raw.read_exact(&mut buf)?;
         let a1 = u32::from_be_bytes(buf);

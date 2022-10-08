@@ -1,16 +1,17 @@
 use std::{
-    io::Write,
+    collections::HashMap,
+    io::{Read, Write},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use super::{
     base_client::BaseClientData,
-    constant::{BUF_0, BUF_1},
+    helper::{BUF_0, BUF_1},
     device::Platform,
     error::CommonError,
+    io::WriteExt,
     protobuf::{encode, ProtobufElement, ProtobufObject},
     tea::{self, encrypt},
-    io::WriteExt,
 };
 
 fn current_timestamp() -> u128 {
@@ -20,9 +21,9 @@ fn current_timestamp() -> u128 {
         .as_millis()
 }
 
- fn pack_body<W: Write>(
+fn pack_body<W: Write>(
     writer: &mut W,
-    base_client: &BaseClientData,
+    data: &BaseClientData,
     tag: u16,
     emp: Option<u32>,
     md5pass: Option<Vec<u8>>,
@@ -33,7 +34,7 @@ fn current_timestamp() -> u128 {
         0x01 => {
             writer.write_u16(1)?;
             writer.write_bytes(&rand::random::<[u8; 4]>())?;
-            writer.write_u32(base_client.uin())?;
+            writer.write_u32(data.uin)?;
             writer.write_bytes(&current_timestamp().to_be_bytes()[..32])?;
             writer.write_bytes(&[0; 4])?;
             writer.write_u16(0)?;
@@ -50,7 +51,7 @@ fn current_timestamp() -> u128 {
             writer.write_u32(7)?;
             writer.write_u32(apk.appid)?;
             writer.write_u32(apk.subid)?;
-            writer.write_bytes(&base_client.device().guid)?;
+            writer.write_bytes(&data.device.guid)?;
             writer.write_tlv(apk.id)?;
             writer.write_tlv(apk.ver)?;
             writer.write_tlv(apk.sign)?;
@@ -59,9 +60,9 @@ fn current_timestamp() -> u128 {
         0x18 => {
             writer.write_u16(1)?;
             writer.write_u32(1536)?;
-            writer.write_u32(base_client.apk().appid)?;
+            writer.write_u32(data.apk.appid)?;
             writer.write_u32(0)?;
-            writer.write_u32(base_client.uin())?;
+            writer.write_u32(data.uin)?;
             writer.write_u16(0)?;
             writer.write_u16(0)?;
             Ok(())
@@ -96,7 +97,7 @@ fn current_timestamp() -> u128 {
             Ok(())
         }
         0x33 => {
-            writer.write_bytes(base_client.device().guid)?;
+            writer.write_bytes(data.device.guid)?;
             Ok(())
         }
         0x35 => {
@@ -106,18 +107,14 @@ fn current_timestamp() -> u128 {
         0x100 => {
             writer.write_u16(1)?;
             writer.write_u32(7)?;
-            writer.write_u32(base_client.apk().appid)?;
-            writer.write_u32(if emp.is_some() {
-                2
-            } else {
-                base_client.apk().subid
-            })?;
+            writer.write_u32(data.apk.appid)?;
+            writer.write_u32(if emp.is_some() { 2 } else { data.apk.subid })?;
             writer.write_u32(8)?;
             writer.write_u32(8)?;
             Ok(())
         }
         0x104 => {
-            writer.write_bytes(base_client.sig().t104)?;
+            writer.write_bytes(data.sig.t104)?;
             Ok(())
         }
         0x106 => {
@@ -126,25 +123,25 @@ fn current_timestamp() -> u128 {
             body.write_u16(4)?;
             body.write_bytes(rand::random::<[u8; 4]>())?;
             body.write_u32(7)?;
-            body.write_u32(base_client.apk().appid)?;
+            body.write_u32(data.apk.appid)?;
             body.write_u32(0)?;
-            body.write_u64(base_client.uin() as u64)?;
+            body.write_u64(data.uin as u64)?;
             body.write_bytes(&current_timestamp().to_be_bytes()[..32])?;
             body.write_bytes([0; 4])?;
             body.write_u8(1)?;
             body.write_bytes(&md5pass)?;
-            body.write_bytes(base_client.sig().tgtgt)?;
+            body.write_bytes(data.sig.tgtgt)?;
             body.write_u32(0)?;
             body.write_u8(1)?;
-            body.write_bytes(base_client.device().guid)?;
-            body.write_u32(base_client.apk().subid)?;
+            body.write_bytes(data.device.guid)?;
+            body.write_u32(data.apk.subid)?;
             body.write_u32(1)?;
-            body.write_tlv(base_client.uin().to_be_bytes())?;
+            body.write_tlv(data.uin.to_be_bytes())?;
             body.write_u16(0)?;
 
             let mut key = md5pass.clone();
             key.extend([0; 4]);
-            key.extend(base_client.uin().to_be_bytes());
+            key.extend(data.uin.to_be_bytes());
             let key = md5::compute(&key).0;
 
             body.extend(key);
@@ -160,28 +157,28 @@ fn current_timestamp() -> u128 {
             Ok(())
         }
         0x109 => {
-            writer.write_bytes(md5::compute(&base_client.device().imei).0)?;
+            writer.write_bytes(md5::compute(&data.device.imei).0)?;
             Ok(())
         }
         0x10a => {
-            writer.write_bytes(base_client.sig().tgt)?;
+            writer.write_bytes(&data.sig.tgt)?;
             Ok(())
         }
         0x116 => {
             writer.write_u8(0)?;
-            writer.write_u32(base_client.apk().bitmap)?;
+            writer.write_u32(data.apk.bitmap)?;
             writer.write_u32(0x10400)?;
             writer.write_u8(1)?;
             writer.write_u32(1600000226)?;
             Ok(())
         }
         0x124 => {
-            writer.write_tlv(&base_client.device().os_type[..16])?;
-            writer.write_tlv(&base_client.device().version.release[..16])?;
+            writer.write_tlv(&data.device.os_type[..16])?;
+            writer.write_tlv(&data.device.version.release[..16])?;
             writer.write_u16(2)?;
-            writer.write_tlv(&base_client.device().sim[..16])?;
+            writer.write_tlv(&data.device.sim[..16])?;
             writer.write_u16(0)?;
-            writer.write_tlv(&base_client.device().apn[..16])?;
+            writer.write_tlv(&data.device.apn[..16])?;
             Ok(())
         }
         0x128 => {
@@ -190,65 +187,65 @@ fn current_timestamp() -> u128 {
             writer.write_u8(1)?;
             writer.write_u8(0)?;
             writer.write_u32(16777216)?;
-            writer.write_tlv(&base_client.device().model[..32])?;
-            writer.write_tlv(&base_client.device().guid[..16])?;
-            writer.write_tlv(&base_client.device().brand[..16])?;
+            writer.write_tlv(&data.device.model[..32])?;
+            writer.write_tlv(&data.device.guid[..16])?;
+            writer.write_tlv(&data.device.brand[..16])?;
             Ok(())
         }
         0x141 => {
             writer.write_u16(1)?;
-            writer.write_tlv(base_client.device().sim)?;
+            writer.write_tlv(data.device.sim)?;
             writer.write_u16(2)?;
-            writer.write_tlv(base_client.device().apn)?;
+            writer.write_tlv(data.device.apn)?;
             Ok(())
         }
         0x142 => {
             writer.write_u16(0)?;
-            writer.write_tlv(&base_client.apk().id[..32])?;
+            writer.write_tlv(&data.apk.id[..32])?;
             Ok(())
         }
         0x143 => {
-            writer.write_bytes(base_client.sig().d2)?;
+            writer.write_bytes(&data.sig.d2)?;
             Ok(())
         }
         0x144 => {
             let mut body = Vec::with_capacity(200);
             body.write_u16(5)?;
-            body.write_bytes(pack_tlv(base_client, 0x109)?)?;
-            body.write_bytes(pack_tlv(base_client, 0x52d)?)?;
-            body.write_bytes(pack_tlv(base_client, 0x124)?)?;
-            body.write_bytes(pack_tlv(base_client, 0x128)?)?;
-            body.write_bytes(pack_tlv(base_client, 0x16e)?)?;
+            body.write_bytes(pack_tlv(data, 0x109)?)?;
+            body.write_bytes(pack_tlv(data, 0x52d)?)?;
+            body.write_bytes(pack_tlv(data, 0x124)?)?;
+            body.write_bytes(pack_tlv(data, 0x128)?)?;
+            body.write_bytes(pack_tlv(data, 0x16e)?)?;
 
-            writer.write_bytes(encrypt(body, &base_client.sig().tgtgt)?)?;
+            writer.write_bytes(encrypt(body, &data.sig.tgtgt)?)?;
             Ok(())
         }
         0x145 => {
-            writer.write_bytes(base_client.device().guid)?;
+            writer.write_bytes(data.device.guid)?;
             Ok(())
         }
         0x147 => {
-            writer.write_u32(base_client.apk().appid)?;
-            writer.write_tlv(&base_client.apk().ver[..5])?;
-            writer.write_tlv(base_client.apk().sign)?;
+            writer.write_u32(data.apk.appid)?;
+            writer.write_tlv(&data.apk.ver[..5])?;
+            writer.write_tlv(data.apk.sign)?;
             Ok(())
         }
         0x154 => {
-            writer.write_u32(base_client.sig().seq + 1)?;
+            writer.write_u32(data.sig.seq + 1)?;
             Ok(())
         }
         0x16e => {
-            writer.write_bytes(base_client.device().model)?;
+            writer.write_bytes(data.device.model)?;
             Ok(())
         }
         0x174 => {
-            writer.write_bytes(base_client.sig().t174)?;
+            writer.write_bytes(data.sig.t174)?;
             Ok(())
         }
         0x177 => {
             writer.write_u8(0x01)?;
-            writer.write_u32(base_client.apk().buildtime)?;
-            writer.write_tlv(base_client.apk().sdkver)?;
+            writer.write_u32(data.apk.buildtime)?;
+            writer.write_tlv(data.apk.sdkver)?;
             Ok(())
         }
         0x17a => {
@@ -260,11 +257,11 @@ fn current_timestamp() -> u128 {
             Ok(())
         }
         0x187 => {
-            writer.write_bytes(md5::compute(&base_client.device().mac_address).0)?;
+            writer.write_bytes(md5::compute(&data.device.mac_address).0)?;
             Ok(())
         }
         0x188 => {
-            writer.write_bytes(md5::compute(&base_client.device().android_id).0)?;
+            writer.write_bytes(md5::compute(&data.device.android_id).0)?;
             Ok(())
         }
         0x191 => {
@@ -276,7 +273,7 @@ fn current_timestamp() -> u128 {
             Ok(())
         }
         0x194 => {
-            writer.write_bytes(base_client.device().imsi)?;
+            writer.write_bytes(data.device.imsi)?;
             Ok(())
         }
         0x197 => {
@@ -288,14 +285,14 @@ fn current_timestamp() -> u128 {
             Ok(())
         }
         0x202 => {
-            writer.write_tlv(&base_client.device().wifi_bssid[..16])?;
-            writer.write_tlv(&base_client.device().wifi_ssid[..32])?;
+            writer.write_tlv(&data.device.wifi_bssid[..16])?;
+            writer.write_tlv(&data.device.wifi_ssid[..32])?;
             Ok(())
         }
         0x400 => {
             writer.write_u16(1)?;
-            writer.write_u64(base_client.uin() as u64)?;
-            writer.write_bytes(base_client.device().guid)?;
+            writer.write_u64(data.uin as u64)?;
+            writer.write_bytes(data.device.guid)?;
             writer.write_bytes(rand::random::<[u8; 16]>())?;
             writer.write_i32(1)?;
             writer.write_i32(16)?;
@@ -351,7 +348,7 @@ fn current_timestamp() -> u128 {
             Ok(())
         }
         0x52d => {
-            let device = base_client.device();
+            let device = &data.device;
             let buf = encode(&ProtobufObject::from([
                 (1, ProtobufElement::from(device.bootloader)),
                 (2, ProtobufElement::from(device.proc_version.as_str())),
@@ -371,9 +368,9 @@ fn current_timestamp() -> u128 {
     }
 }
 
-pub  fn pack_tlv(base_client: &BaseClientData, tag: u16) -> Result<Vec<u8>, CommonError> {
+pub fn pack_tlv(data: &BaseClientData, tag: u16) -> Result<Vec<u8>, CommonError> {
     let mut body = Vec::with_capacity(200);
-    pack_body(&mut body, base_client, tag, None, None, None, None)?;
+    pack_body(&mut body, data, tag, None, None, None, None)?;
     let len = body.len();
     body.write_u16(len as u16)?;
     body.write_u16(tag)?;
@@ -396,62 +393,34 @@ pub trait WriteTlvExt: Write {
 
 impl<W: Write> WriteTlvExt for W {}
 
-// pin_project! {
-//     #[derive(Debug)]
-//     #[must_use = "futures do nothing unless you `.await` or poll them"]
-//     pub struct WriteTlv<'a, W: ?Sized> {
-//         writer:&'a mut W,
-//         buf: &'a [u8],
-//         #[pin]
-//         _pin: PhantomPinned,
-//     }
-// }
+pub trait ReadTlvExt: Read {
+    fn read_tlv(&mut self) -> Result<HashMap<u16, Vec<u8>>, std::io::Error> {
+        let mut result = HashMap::new();
+        let mut tag_buf = [0; 2];
+        let mut len_buf = [0; 2];
+        loop {
+            match self.read_exact(&mut tag_buf) {
+                Ok(_) => {
+                    let tag = u16::from_be_bytes(tag_buf);
+                    self.read_exact(&mut len_buf)?;
+                    let len = u16::from_be_bytes(len_buf);
 
-// impl<W> Future for WriteTlv<'_, W>
-// where
-//     W: ?Sized + Unpin + AsyncWrite,
-// {
-//     type Output = std::io::Result<()>;
+                    let mut buf = Vec::with_capacity(len as usize);
+                    self.read_exact(&mut buf)?;
+                    result.insert(tag, buf);
+                },
+                Err(err) => {
+                    if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                        break;
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
 
-//     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-//         let me = self.project();
+        Ok(result)
+    }
+}
 
-//         let len_bytes = (me.buf.len() as u32).to_be_bytes();
-//         let buf = &mut (&len_bytes as &[u8]);
-//         while !buf.is_empty() {
-//             let n = ready!(Pin::new(&mut *me.writer).poll_write(cx, buf))?;
-//             {
-//                 let (_, rest) = std::mem::take(&mut *buf).split_at(n);
-//                 *buf = rest;
-//             }
-//             if n == 0 {
-//                 return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
-//             }
-//         }
-
-//         while !me.buf.is_empty() {
-//             let n = ready!(Pin::new(&mut *me.writer).poll_write(cx, me.buf))?;
-//             {
-//                 let (_, rest) = std::mem::take(&mut *me.buf).split_at(n);
-//                 *me.buf = rest;
-//             }
-//             if n == 0 {
-//                 return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
-//             }
-//         }
-
-//         Poll::Ready(Ok(()))
-//     }
-// }
-
-// pub trait AsyncWriteTlvExt: AsyncWrite {
-//     fn write_tlv<'a>(&'a mut self, buf: &'a [u8]) -> WriteTlv<'a, Self> {
-//         WriteTlv {
-//             writer: self,
-//             buf,
-//             _pin: PhantomPinned,
-//         }
-//     }
-// }
-
-// impl<W: AsyncWrite + ?Sized> AsyncWriteTlvExt for W {}
+impl<R: Read> ReadTlvExt for R {}

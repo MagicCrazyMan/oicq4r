@@ -113,6 +113,12 @@ impl From<flate2::DecompressError> for CommonError {
     }
 }
 
+impl From<std::string::FromUtf8Error> for CommonError {
+    fn from(err: std::string::FromUtf8Error) -> Self {
+        Self(err.to_string())
+    }
+}
+
 impl From<protobuf::Error> for CommonError {
     fn from(err: protobuf::Error) -> Self {
         Self(err.to_string())

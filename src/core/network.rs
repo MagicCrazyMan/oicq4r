@@ -105,7 +105,7 @@ impl Network {
             self.state_tx.send((NetworkState::Connecting, None))?;
 
             // 使用尝试连接服务器
-            let tcp = TcpStream::connect(self.resolve().await?).await?;
+            let tcp = TcpStream::connect(self.resolve_target_sevrer().await?).await?;
             let target_server = tcp.peer_addr().ok();
 
             let (readable, writeable) = tcp.into_split();
@@ -141,7 +141,8 @@ impl Network {
         }
     }
 
-    pub async fn send_bytes(&mut self, bytes: &[u8]) -> Result<(), CommonError> {
+    pub async fn send_bytes<B: AsRef<[u8]>>(&mut self, bytes: B) -> Result<(), CommonError> {
+        let bytes = bytes.as_ref();
         if let NetworkState::Connected = self.state().await {
             let mut writer = self.tcp_writer.lock().await;
             let writer = writer.borrow_mut().as_mut().unwrap();
@@ -152,7 +153,7 @@ impl Network {
         }
     }
 
-    async fn resolve(&mut self) -> Result<(&str, u16), CommonError> {
+    async fn resolve_target_sevrer(&mut self) -> Result<(&str, u16), CommonError> {
         if !self.auto_search {
             return Ok(DEFAULT_SERVER);
         }
@@ -325,7 +326,7 @@ mod test {
     #[tokio::test]
     async fn test_resolve() -> Result<(), CommonError> {
         let mut network = Network::new();
-        let (addr, port) = network.resolve().await?;
+        let (addr, port) = network.resolve_target_sevrer().await?;
         let socket_addr = (addr.to_string(), port);
 
         assert_ne!(network.server_list.len(), 0);
