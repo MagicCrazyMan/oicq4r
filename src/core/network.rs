@@ -126,7 +126,7 @@ impl Network {
     }
 
     pub async fn disconnect(&mut self) -> Result<(), CommonError> {
-        if let NetworkState::Connected = self.state().await {
+        if NetworkState::Connected == self.state().await {
             *self.close_manually.lock().await = true;
 
             if let Some(mut stream) = self.tcp_writer.lock().await.take() {
@@ -143,7 +143,7 @@ impl Network {
 
     pub async fn send_bytes<B: AsRef<[u8]>>(&mut self, bytes: B) -> Result<(), CommonError> {
         let bytes = bytes.as_ref();
-        if let NetworkState::Connected = self.state().await {
+        if NetworkState::Connected == self.state().await {
             let mut writer = self.tcp_writer.lock().await;
             let writer = writer.borrow_mut().as_mut().unwrap();
             writer.write_all(bytes).await?;
