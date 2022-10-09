@@ -21,6 +21,18 @@ impl CommonError {
     pub fn illegal_data() -> Self {
         CommonError::new("illegal data")
     }
+
+    pub fn bad_token() -> Self {
+        CommonError::new("bad token")
+    }
+
+    pub fn not_registered() -> Self {
+        CommonError::new("not registered")
+    }
+
+    pub fn tag_not_existed(tag: u16) -> Self {
+        CommonError::new(format!("tag {:x} not existed", tag))
+    }
 }
 
 impl From<String> for CommonError {

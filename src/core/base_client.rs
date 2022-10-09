@@ -79,8 +79,8 @@ pub struct SIG {
     pub skey: Vec<u8>,
     pub d2: Vec<u8>,
     pub d2key: [u8; 16],
-    pub t104: [u8; 0],
-    pub t174: [u8; 0],
+    pub t104: Vec<u8>,
+    pub t174: Vec<u8>,
     pub qrsig: [u8; 0],
     pub bigdata: BigData,
     pub hb480: Vec<u8>,
@@ -106,8 +106,8 @@ impl SIG {
             skey: vec![],
             d2: vec![],
             d2key: [0; 16],
-            t104: BUF_0,
-            t174: BUF_0,
+            t104: vec![],
+            t174: vec![],
             qrsig: BUF_0,
             bigdata: BigData::new(),
             hb480,
@@ -194,6 +194,7 @@ pub enum CommandType {
 #[derive(Debug, Clone)]
 pub enum InternalErrorKind {
     Token,
+    UnknownLoginType(u8, String),
 }
 
 impl std::error::Error for InternalErrorKind {}
@@ -366,6 +367,9 @@ pub struct BaseClient {
     error_tx: Sender<InternalErrorKind>,
     sso_tx: Sender<(u32, String, Vec<u8>)>,
     token_tx: Sender<Vec<u8>>,
+    online_tx: Sender<User>,
+    slider_tx: Sender<String>,
+    verify_tx: Sender<(Option<String>, Option<String>)>,
 }
 
 impl BaseClient {
@@ -373,11 +377,15 @@ impl BaseClient {
         let error_tx = sync::broadcast::channel(1).0;
         let sso_tx = sync::broadcast::channel(1).0;
         let token_tx = sync::broadcast::channel(1).0;
+        let online_tx = sync::broadcast::channel(1).0;
+        let slider_tx = sync::broadcast::channel(1).0;
+        let verify_tx = sync::broadcast::channel(1).0;
 
         let data = Arc::new(Mutex::new(Data::new(uin, platform, d)));
         let statistics = Arc::new(Mutex::new(Statistics::new()));
         let networker = Arc::new(Mutex::new(Networker::new(
             Arc::clone(&statistics),
+            Arc::clone(&data),
             error_tx.clone(),
         )));
         let register = Arc::new(Mutex::new(Registry::new(
@@ -394,6 +402,9 @@ impl BaseClient {
             error_tx,
             sso_tx,
             token_tx,
+            online_tx,
+            slider_tx,
+            verify_tx,
         };
 
         instance.describe_network_packet().await;
@@ -589,7 +600,185 @@ impl BaseClient {
     }
 }
 
-impl BaseClient {}
+impl BaseClient {
+    pub async fn token_login<B: AsRef<[u8]>>(&mut self, token: B) -> Result<(), CommonError> {
+        let token = token.as_ref();
+        if token.len() != 144 || token.len() != 152 {
+            return Err(CommonError::bad_token());
+        }
+
+        let mut data = self.data().await;
+        data.sig.session = rand::random::<[u8; 4]>();
+        data.sig.randkey = rand::random::<[u8; 16]>();
+        data.ecdh = ECDH::new();
+        data.sig.d2key = token[..16].try_into().unwrap();
+        data.sig.d2 = token[16..token.len() - 72].to_vec();
+        data.sig.tgt = token[token.len() - 72..].to_vec();
+        data.sig.tgtgt = md5::compute(data.sig.d2key).0;
+
+        let mut body = Vec::with_capacity(400);
+        body.write_u16(11)?;
+        body.write_u16(16)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x100)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x10a)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x116)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x144)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x143)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x142)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x154)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x18)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x141)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x8)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x147)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x177)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x187)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x188)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x202)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x511)?)?;
+
+        let request = data.build_login_request(LoginCommand::WtLoginExchangeEmp, body, None)?;
+        drop(data);
+
+        self.login(request).await
+    }
+
+    async fn login(&mut self, request: LoginRequest) -> Result<(), CommonError> {
+        let response_body = self
+            .networker
+            .lock()
+            .await
+            .send_registered_request(request, None)
+            .await?
+            .await?;
+
+        self.decode_login_response(response_body).await?;
+
+        Ok(())
+    }
+
+    #[async_recursion]
+    async fn decode_login_response(&mut self, payload: Vec<u8>) -> Result<(), CommonError> {
+        let mut data = self.data().await;
+        let decrypted = tea::decrypt(&mut &payload[16..], &data.ecdh.share_key)?;
+        let typee = decrypted[2];
+        let mut t = (&mut &decrypted[5..]).read_tlv()?;
+
+        if typee == 204 {
+            info!("unlocking...");
+
+            data.sig.t104 = t
+                .remove(&0x104)
+                .ok_or(CommonError::tag_not_existed(0x104))?;
+
+            let mut body = Vec::with_capacity(500);
+            body.write_u16(20)?;
+            body.write_u16(4)?;
+            body.write_bytes(tlv::pack_tlv(&data, 0x8)?)?;
+            body.write_bytes(tlv::pack_tlv(&data, 0x104)?)?;
+            body.write_bytes(tlv::pack_tlv(&data, 0x116)?)?;
+            body.write_bytes(tlv::pack_tlv(&data, 0x401)?)?;
+
+            let request = data.build_login_request(LoginCommand::WtLoginLogin, body, None)?;
+            drop(data);
+
+            self.login(request).await?;
+            Ok(())
+        } else if typee == 0 {
+            data.sig.t104.clear();
+            data.sig.t174.clear();
+
+            let t119 = t
+                .remove(&0x119)
+                .ok_or(CommonError::tag_not_existed(0x119))?;
+            let user = data.decode_t119(t119)?;
+            drop(data);
+
+            let registered = self.register.lock().await.register().await?;
+            if registered {
+                let _ = self.online_tx.send(user);
+            }
+
+            Ok(())
+        } else if typee == 15 || typee == 16 {
+            let _ = self.error_tx.send(InternalErrorKind::Token);
+            Ok(())
+        } else if typee == 2 {
+            data.sig.t104 = t
+                .remove(&0x104)
+                .ok_or(CommonError::tag_not_existed(0x104))?;
+
+            if let Some(t192) = t.remove(&0x192) {
+                let _ = self.slider_tx.send(String::from_utf8(t192)?);
+            } else {
+                let _ = self.error_tx.send(InternalErrorKind::UnknownLoginType(
+                    typee,
+                    "[登陆失败] 未知格式的验证码".to_string(),
+                ));
+            };
+
+            Ok(())
+        } else if typee == 160 {
+            let t204 = t.remove(&0x204);
+            let t174 = t.remove(&0x174);
+            if t204.is_none() && t174.is_none() {
+                info!("已向密保手机发送短信验证码");
+                return Ok(());
+            }
+
+            let t178 = t.remove(&0x178);
+            let phone = if let (Some(t174), Some(t178)) = (t174, t178) {
+                data.sig.t104 = t
+                    .remove(&0x104)
+                    .ok_or(CommonError::tag_not_existed(0x104))?;
+                data.sig.t174 = t174;
+
+                Some(String::from_utf8(data.sig.t174.clone())?)
+            } else {
+                None
+            };
+
+            let t204 = t
+                .remove(&0x204)
+                .and_then(|buf| String::from_utf8(buf).or::<String>(Ok(String::new())).ok());
+            let _ = self.verify_tx.send((t204, phone));
+
+            Ok(())
+        } else if t.contains_key(&0x149) {
+            let t149 = t.remove(&0x149).unwrap();
+            let reader = &mut &t149[2..];
+
+            let len = reader.read_u16()?;
+            let title = String::from_utf8(reader.read_bytes(len as usize)?)?;
+            let len = reader.read_u16()?;
+            let content = String::from_utf8(reader.read_bytes(len as usize)?)?;
+            let _ = self.error_tx.send(InternalErrorKind::UnknownLoginType(
+                typee,
+                format!("[{}] {}", title, content),
+            ));
+            Ok(())
+        } else if t.contains_key(&0x146) {
+            let t146 = t.remove(&0x146).unwrap();
+            let reader = &mut &t146[4..];
+
+            let len = reader.read_u16()?;
+            let title = String::from_utf8(reader.read_bytes(len as usize)?)?;
+            let len = reader.read_u16()?;
+            let content = String::from_utf8(reader.read_bytes(len as usize)?)?;
+            let _ = self.error_tx.send(InternalErrorKind::UnknownLoginType(
+                typee,
+                format!("[{}] {}", title, content),
+            ));
+
+            Ok(())
+        } else {
+            let _ = self.error_tx.send(InternalErrorKind::UnknownLoginType(
+                typee,
+                "[登陆失败] 未知错误".to_string(),
+            ));
+            Ok(())
+        }
+    }
+}
 
 impl BaseClient {}
 
@@ -646,25 +835,25 @@ impl Data {
         next
     }
 
-    fn build_request<B>(
+    fn build_login_request<B>(
         &mut self,
         command: LoginCommand,
         body: B,
-        r#type: Option<CommandType>,
+        typee: Option<CommandType>,
     ) -> Result<LoginRequest, CommonError>
     where
         B: AsRef<[u8]>,
     {
         let seq = self.increase_seq();
 
-        let r#type = r#type.unwrap_or(CommandType::Type2);
+        let typee = typee.unwrap_or(CommandType::Type2);
         let (uin, cmd_id, subid) = match command {
             LoginCommand::WtLoginTransEmp => (0, 0x812, Platform::watch().subid),
             _ => (self.uin, 0x810, self.apk.subid),
         };
 
         let mut buf_1;
-        let body = match r#type {
+        let body = match typee {
             CommandType::Type2 => {
                 let encrypted = tea::encrypt(&body, &self.ecdh.share_key)?;
                 let mut buf_0 =
@@ -718,7 +907,7 @@ impl Data {
         sso.write_bytes_with_length(buf)?;
         sso.write_bytes_with_length(body)?;
 
-        let encrypted_sso = match r#type {
+        let encrypted_sso = match typee {
             CommandType::Type1 => tea::encrypt(sso, &self.sig.d2key)?,
             CommandType::Type2 => tea::encrypt(sso, &BUF_16)?,
             _ => sso,
@@ -726,7 +915,7 @@ impl Data {
 
         let mut payload = Vec::with_capacity(100);
         payload.write_u32(0x0A)?;
-        payload.write_u8(r#type as u8)?;
+        payload.write_u8(typee as u8)?;
         payload.write_bytes_with_length(&self.sig.d2)?;
         payload.write_u8(0)?;
         payload.write_bytes_with_length(uin.to_string())?;
@@ -843,7 +1032,7 @@ impl Data {
             "SvcReqRegister",
             None,
         )?;
-        let pkt = self.build_request(
+        let pkt = self.build_login_request(
             LoginCommand::StatSvcRegister,
             body,
             Some(CommandType::Type1),
@@ -861,16 +1050,16 @@ impl Data {
 
         self.sig.tgt = t
             .remove(&0x10a)
-            .ok_or(CommonError::new("tag 0x10a not existed"))?;
+            .ok_or(CommonError::tag_not_existed(0x10a))?;
         self.sig.skey = t
             .remove(&0x120)
-            .ok_or(CommonError::new("tag 0x120 not existed"))?;
+            .ok_or(CommonError::tag_not_existed(0x120))?;
         self.sig.d2 = t
             .remove(&0x143)
-            .ok_or(CommonError::new("tag 0x143 not existed"))?;
+            .ok_or(CommonError::tag_not_existed(0x143))?;
         self.sig.d2key = t
             .remove(&0x305)
-            .ok_or(CommonError::new("tag 0x305 not existed"))?[..16]
+            .ok_or(CommonError::tag_not_existed(0x305))?[..16]
             .try_into()?;
         self.sig.tgtgt = md5::compute(&self.sig.d2key).0;
         self.sig.emp_time = current_unix_timestamp_as_secs();
@@ -899,7 +1088,7 @@ impl Data {
         token.extend(&self.sig.tgt);
         let ddd = t
             .remove(&0x11a)
-            .ok_or(CommonError::new("tag 0x11a not existed"))?;
+            .ok_or(CommonError::tag_not_existed(0x11a))?;
         let age = ddd[2];
         let gender = ddd[3];
         let nickname = String::from_utf8(ddd[5..].to_vec())?;
@@ -911,16 +1100,12 @@ impl Data {
             age,
         })
     }
-
-    fn decode_login_response<B: AsRef<[u8]>>(&mut self, payload: B) -> Result<(), CommonError> {
-        let decrypted = tea::decrypt(&mut &payload.as_ref()[16..], &self.ecdh.share_key)?;
-
-        todo!()
-    }
 }
+
 #[derive(Debug)]
 struct Networker {
     statistics: Arc<Mutex<Statistics>>,
+    data: Arc<Mutex<Data>>,
     network: Network,
     polling_requests: HashMap<u32, Weak<Mutex<Option<Vec<u8>>>>>,
     registered: AtomicBool,
@@ -929,9 +1114,14 @@ struct Networker {
 }
 
 impl Networker {
-    fn new(statistics: Arc<Mutex<Statistics>>, error_tx: Sender<InternalErrorKind>) -> Self {
+    fn new(
+        statistics: Arc<Mutex<Statistics>>,
+        data: Arc<Mutex<Data>>,
+        error_tx: Sender<InternalErrorKind>,
+    ) -> Self {
         Self {
             statistics,
+            data,
             network: Network::new(),
             polling_requests: HashMap::new(),
             registered: AtomicBool::new(false),
@@ -1004,7 +1194,7 @@ impl Networker {
         Ok(())
     }
 
-    async fn send_register(
+    async fn register(
         &mut self,
         request: LoginRequest,
         refresh: bool,
@@ -1043,16 +1233,19 @@ impl Networker {
         }
     }
 
-    async fn send_unregister(&mut self, request: LoginRequest) -> Result<(), CommonError> {
+    async fn unregister(&mut self, request: LoginRequest) -> Result<(), CommonError> {
         self.set_registered(false);
         self.write_request(request).await?;
         Ok(())
     }
 
     /// 发送一个业务包但不等待返回
-    pub async fn write_uni(&mut self, request: UniRequest) -> Result<(), CommonError> {
+    pub async fn write_registered_request<B>(&mut self, request: B) -> Result<(), CommonError>
+    where
+        B: Request,
+    {
         if !self.registered() {
-            return Err(CommonError::new("not register"));
+            return Err(CommonError::not_registered());
         }
 
         self.write_request(request).await?;
@@ -1060,20 +1253,21 @@ impl Networker {
     }
 
     /// 发送一个业务包并等待返回结果
-    pub async fn send_uni(
+    pub async fn send_registered_request<B>(
         &mut self,
-        request: UniRequest,
+        request: B,
         timeout: Option<Duration>,
-    ) -> Result<Response, CommonError> {
+    ) -> Result<Response, CommonError>
+    where
+        B: Request,
+    {
         if !self.registered() {
-            return Err(CommonError::new("not register"));
+            return Err(CommonError::not_registered());
         }
 
         let response = self.send_request(request, timeout).await?;
         Ok(response)
     }
-
-    // async fn send_login_request(&mut self, cmd: Command, body: &[u8]) {}
 
     async fn response_a_request(&mut self, seq: u32, payload: Vec<u8>) -> bool {
         if let Some(packet) = self
@@ -1112,9 +1306,9 @@ impl Registry {
         }
     }
 
-    async fn register(&mut self) -> Result<(), CommonError> {
+    async fn register(&mut self) -> Result<bool, CommonError> {
         if self.networker.lock().await.registered() {
-            return Ok(());
+            return Ok(true);
         }
 
         if let Some(handler) = self.heartbeat_handler.take() {
@@ -1123,12 +1317,7 @@ impl Registry {
         }
 
         let request = self.data.lock().await.build_register_request(false)?;
-        let registered = self
-            .networker
-            .lock()
-            .await
-            .send_register(request, false)
-            .await?;
+        let registered = self.networker.lock().await.register(request, false).await?;
         if registered {
             let heartbeater = Heartbeater::new(
                 Arc::clone(&self.data),
@@ -1138,7 +1327,7 @@ impl Registry {
             self.heartbeat_handler = Some(heartbeater.start_heartbeat());
         }
 
-        Ok(())
+        Ok(registered)
     }
 
     async fn unregister(&mut self) -> Result<(), CommonError> {
@@ -1152,7 +1341,7 @@ impl Registry {
         };
 
         let request = self.data.lock().await.build_register_request(true)?;
-        self.networker.lock().await.send_unregister(request).await?;
+        self.networker.lock().await.unregister(request).await?;
         Ok(())
     }
 }
@@ -1195,7 +1384,7 @@ impl Heartbeater {
     }
 
     async fn sync_time_diff(&mut self) -> Result<(), CommonError> {
-        let request_packet = self.data.lock().await.build_request(
+        let request_packet = self.data.lock().await.build_login_request(
             LoginCommand::ClientCorrectTime,
             BUF_4,
             Some(CommandType::Type0),
@@ -1243,7 +1432,7 @@ impl Heartbeater {
         body.write_bytes(tlv::pack_tlv(&data, 0x188)?)?;
         body.write_bytes(tlv::pack_tlv(&data, 0x202)?)?;
         body.write_bytes(tlv::pack_tlv(&data, 0x511)?)?;
-        let packet = data.build_request(LoginCommand::WtLoginExchangeEmp, body, None)?;
+        let packet = data.build_login_request(LoginCommand::WtLoginExchangeEmp, body, None)?;
         drop(data);
 
         let request = self
@@ -1255,21 +1444,16 @@ impl Heartbeater {
         let response = request.await?;
 
         let decrypted = tea::decrypt(&response[16..], &self.data.lock().await.ecdh.share_key)?;
-        let r#type = decrypted[2];
+        let typee = decrypted[2];
         let mut t = (&mut &decrypted[5..]).read_tlv()?;
-        if r#type == 0 {
+        if typee == 0 {
             let t119 = t
                 .remove(&0x119)
                 .ok_or(CommonError::new("tag 0x119 not existed"))?;
             let user = self.data.lock().await.decode_t119(t119)?;
 
             let request = self.data.lock().await.build_register_request(false)?;
-            let registered = self
-                .networker
-                .lock()
-                .await
-                .send_register(request, true)
-                .await?;
+            let registered = self.networker.lock().await.register(request, true).await?;
 
             if registered {
                 let _ = self.token_tx.send(user.token);

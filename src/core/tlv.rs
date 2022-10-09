@@ -114,7 +114,7 @@ fn pack_body<W: Write>(
             Ok(())
         }
         0x104 => {
-            writer.write_bytes(data.sig.t104)?;
+            writer.write_bytes(&data.sig.t104)?;
             Ok(())
         }
         0x106 => {
@@ -239,7 +239,7 @@ fn pack_body<W: Write>(
             Ok(())
         }
         0x174 => {
-            writer.write_bytes(data.sig.t174)?;
+            writer.write_bytes(&data.sig.t174)?;
             Ok(())
         }
         0x177 => {
