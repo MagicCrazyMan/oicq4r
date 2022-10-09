@@ -483,7 +483,6 @@ pub struct User {
 }
 #[derive(Debug)]
 pub struct Data {
-    pub statistics: Statistics,
     pub pskey: HashMap<String, Vec<u8>>,
     pub uin: u32,
     pub apk: APK,
@@ -495,7 +494,6 @@ pub struct Data {
 impl Data {
     fn new(uin: u32, platform: Platform, d: Option<ShortDevice>) -> Self {
         Self {
-            statistics: Statistics::new(),
             pskey: HashMap::new(),
             uin,
             apk: platform.metadata(),
@@ -715,19 +713,20 @@ impl Data {
 }
 #[derive(Debug)]
 struct Requester {
-    data: Arc<Mutex<Data>>,
     network: Arc<Mutex<Network>>,
     polling_requests: Arc<Mutex<HashMap<u32, Weak<Mutex<Option<Vec<u8>>>>>>>,
+
+    statistics: Arc<Mutex<Statistics>>,
 }
 
 impl Requester {
     fn new(
-        data: Arc<Mutex<Data>>,
+        statistics: Arc<Mutex<Statistics>>,
         network: Arc<Mutex<Network>>,
         polling_requests: Arc<Mutex<HashMap<u32, Weak<Mutex<Option<Vec<u8>>>>>>>,
     ) -> Self {
         Self {
-            data,
+            statistics,
             network,
             polling_requests,
         }
@@ -752,19 +751,7 @@ impl Requester {
             .lock()
             .await
             .insert(request_packet.seq(), response);
-        self.network
-            .lock()
-            .await
-            .send_bytes(request_packet.payload())
-            .await?;
-
-        self.data.lock().await.statistics.sent_pkt_cnt += 1;
-
-        debug!(
-            "send: {} seq: {}",
-            request_packet.command(),
-            request_packet.seq()
-        );
+        self.write_request(request_packet).await?;
 
         Ok(request)
     }
@@ -780,7 +767,7 @@ impl Requester {
             .send_bytes(request_packet.payload())
             .await?;
 
-        self.data.lock().await.statistics.sent_pkt_cnt += 1;
+        self.statistics.lock().await.sent_pkt_cnt += 1;
 
         debug!(
             "send: {} seq: {}",
@@ -835,6 +822,7 @@ impl Requester {
 #[derive(Debug)]
 pub struct BaseClient {
     data: Arc<Mutex<Data>>,
+    statistics: Arc<Mutex<Statistics>>,
 
     registered: Arc<AtomicBool>,
     network: Arc<Mutex<Network>>,
@@ -847,8 +835,10 @@ pub struct BaseClient {
 
 impl BaseClient {
     pub async fn new(uin: u32, platform: Platform, d: Option<ShortDevice>) -> Self {
+        let statistics = Arc::new(Mutex::new(Statistics::new()));
         let mut instance = Self {
             data: Arc::new(Mutex::new(Data::new(uin, platform, d))),
+            statistics,
 
             registered: Arc::new(AtomicBool::new(false)),
             network: Arc::new(Mutex::new(Network::new())),
@@ -896,7 +886,7 @@ impl BaseClient {
     }
 
     async fn describe_network_state(&mut self) {
-        let data = Arc::clone(&self.data);
+        let statistics = Arc::clone(&self.statistics);
 
         let mut rx = self.network.lock().await.on_state();
         tokio::spawn(async move {
@@ -907,12 +897,12 @@ impl BaseClient {
 
                 let _ = match state {
                     NetworkState::Closed => {
-                        data.lock().await.statistics.remote_socket_addr = None;
+                        statistics.lock().await.remote_socket_addr = None;
 
                         info!("{} closed", socket_addr_str);
                     }
                     NetworkState::Lost => {
-                        data.lock().await.statistics.lost_times += 1;
+                        statistics.lock().await.lost_times += 1;
 
                         error!("{} lost", socket_addr_str);
                     }
@@ -920,7 +910,7 @@ impl BaseClient {
                         info!("connecting...")
                     }
                     NetworkState::Connected => {
-                        data.lock().await.statistics.remote_socket_addr = socket_addr.clone();
+                        statistics.lock().await.remote_socket_addr = socket_addr.clone();
 
                         info!("{} connected", socket_addr_str);
                     }
@@ -988,6 +978,7 @@ impl BaseClient {
 
     async fn describe_network_packet(&mut self) {
         let data = Arc::clone(&self.data);
+        let statistics = Arc::clone(&self.statistics);
         let polling_requests = Arc::clone(&self.polling_requests);
 
         let mut rx = self.network.lock().await.on_packet();
@@ -996,7 +987,7 @@ impl BaseClient {
         tokio::spawn(async move {
             let mut z_decompress = Decompress::new(true);
             while let Ok(packet) = rx.recv().await {
-                data.lock().await.statistics.recv_pkt_cnt += 1;
+                statistics.lock().await.recv_pkt_cnt += 1;
 
                 let flag = packet[4];
                 let offset = u32::from_be_bytes(packet[6..10].try_into().unwrap());
@@ -1230,7 +1221,7 @@ impl AsMut<BaseClient> for BaseClient {
 impl From<&BaseClient> for Requester {
     fn from(c: &BaseClient) -> Self {
         Self::new(
-            Arc::clone(&c.data),
+            Arc::clone(&c.statistics),
             Arc::clone(&c.network),
             Arc::clone(&c.polling_requests),
         )
@@ -1263,8 +1254,6 @@ mod tests {
     #[tokio::test]
     async fn test() -> Result<(), CommonError> {
         init_logger();
-
-        info!("123123");
 
         let mut base_client = BaseClient::default(1313).await;
 
