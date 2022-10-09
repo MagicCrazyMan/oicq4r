@@ -5,7 +5,7 @@ use std::{
 };
 
 use super::{
-    base_client::BaseClientData,
+    base_client::Data,
     helper::{BUF_0, BUF_1},
     device::Platform,
     error::CommonError,
@@ -23,7 +23,7 @@ fn current_timestamp() -> u128 {
 
 fn pack_body<W: Write>(
     writer: &mut W,
-    data: &BaseClientData,
+    data: &Data,
     tag: u16,
     emp: Option<u32>,
     md5pass: Option<Vec<u8>>,
@@ -368,7 +368,7 @@ fn pack_body<W: Write>(
     }
 }
 
-pub fn pack_tlv(data: &BaseClientData, tag: u16) -> Result<Vec<u8>, CommonError> {
+pub fn pack_tlv(data: &Data, tag: u16) -> Result<Vec<u8>, CommonError> {
     let mut body = Vec::with_capacity(200);
     pack_body(&mut body, data, tag, None, None, None, None)?;
     let len = body.len();
