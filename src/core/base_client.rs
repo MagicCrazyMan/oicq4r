@@ -1049,19 +1049,6 @@ impl Networker {
         Ok(())
     }
 
-    async fn response_a_request(&mut self, seq: u32, payload: Vec<u8>) -> bool {
-        if let Some(packet) = self
-            .polling_requests
-            .remove(&seq)
-            .and_then(|packet| packet.upgrade())
-        {
-            *packet.lock().await = Some(payload);
-            true
-        } else {
-            false
-        }
-    }
-
     /// 发送一个业务包但不等待返回
     pub async fn write_uni(&mut self, request: UniRequest) -> Result<(), CommonError> {
         if !self.registered() {
@@ -1087,6 +1074,19 @@ impl Networker {
     }
 
     // async fn send_login_request(&mut self, cmd: Command, body: &[u8]) {}
+
+    async fn response_a_request(&mut self, seq: u32, payload: Vec<u8>) -> bool {
+        if let Some(packet) = self
+            .polling_requests
+            .remove(&seq)
+            .and_then(|packet| packet.upgrade())
+        {
+            *packet.lock().await = Some(payload);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Debug)]
