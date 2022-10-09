@@ -357,120 +357,251 @@ impl Future for Response {
 }
 
 #[derive(Debug)]
-struct Heartbeater {
-    retried: u8,
+pub struct BaseClient {
+    statistics: Arc<Mutex<Statistics>>,
     data: Arc<Mutex<Data>>,
-    request_sender: Requester,
+    networker: Arc<Mutex<Networker>>,
+    register: Arc<Mutex<Registry>>,
+
+    error_tx: Sender<InternalErrorKind>,
+    sso_tx: Sender<(u32, String, Vec<u8>)>,
+    token_tx: Sender<Vec<u8>>,
 }
 
-impl Heartbeater {
-    fn new(data: Arc<Mutex<Data>>, request_sender: Requester) -> Self {
-        Self {
-            retried: 0,
+impl BaseClient {
+    pub async fn new(uin: u32, platform: Platform, d: Option<ShortDevice>) -> Self {
+        let error_tx = sync::broadcast::channel(1).0;
+        let sso_tx = sync::broadcast::channel(1).0;
+        let token_tx = sync::broadcast::channel(1).0;
+
+        let data = Arc::new(Mutex::new(Data::new(uin, platform, d)));
+        let statistics = Arc::new(Mutex::new(Statistics::new()));
+        let networker = Arc::new(Mutex::new(Networker::new(
+            Arc::clone(&statistics),
+            error_tx.clone(),
+        )));
+        let register = Arc::new(Mutex::new(Registry::new(
+            Arc::clone(&data),
+            Arc::clone(&networker),
+            token_tx.clone(),
+        )));
+        let mut instance = Self {
             data,
-            request_sender,
-        }
+            networker,
+            statistics,
+            register,
+
+            error_tx,
+            sso_tx,
+            token_tx,
+        };
+
+        instance.describe_network_packet().await;
+        instance.describe_network_state().await;
+        instance.describe_network_error().await;
+
+        instance
     }
 
-    async fn sync_time_diff(&mut self) -> Result<(), CommonError> {
-        let request_packet = self.data.lock().await.build_common_packet(
-            LoginCommand::ClientCorrectTime,
-            BUF_4,
-            Some(CommandType::Type0),
-        )?;
-        let request = self
-            .request_sender
-            .send_request(request_packet, None)
-            .await?;
-        let response = request.await?;
-
-        // 此处忽略错误
-        if let Ok(server_time) = (&mut response.as_slice()).read_i32() {
-            self.data.lock().await.sig.time_diff =
-                server_time as i64 - current_unix_timestamp_as_secs() as i64;
-        }
-
-        Ok(())
+    pub async fn default(uin: u32) -> Self {
+        Self::new(uin, Platform::Android, None).await
     }
 
-    async fn refresh_token(&mut self) -> Result<(), CommonError> {
-        let mut data = self.data.lock().await;
-
-        if current_unix_timestamp_as_secs() - data.sig.emp_time < 14000 {
-            return Ok(());
-        }
-
-        let mut body = Vec::with_capacity(2000);
-        body.write_u16(11)?;
-        body.write_u16(16)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x100)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x10a)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x116)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x144)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x143)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x142)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x154)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x18)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x141)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x8)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x147)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x177)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x187)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x188)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x202)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x511)?)?;
-        let packet = data.build_common_packet(LoginCommand::WtLoginExchangeEmp, body, None)?;
-        drop(data);
-
-        let request = self.request_sender.send_request(packet, None).await?;
-        let response = request.await?;
-
-        let decrypted = tea::decrypt(&response[16..], &self.data.lock().await.ecdh.share_key)?;
-        let r#type = decrypted[2];
-        let t = (&mut &decrypted[5..]).read_tlv()?;
-        if r#type == 0 {
-            let t119 = t
-                .get(&0x119)
-                .ok_or(CommonError::new("tag 0x119 not existed"))?;
-            let user = self.data.lock().await.decode_t119(t119)?;
-
-            todo!()
-        }
-
-        Ok(())
+    pub async fn data(&self) -> MutexGuard<Data> {
+        self.data.lock().await
     }
 
-    #[async_recursion]
-    async fn beat(&mut self) -> Result<(), CommonError> {
-        self.sync_time_diff().await?;
+    pub fn on_error(&self) -> Receiver<InternalErrorKind> {
+        self.error_tx.subscribe()
+    }
 
-        let request_packet = self.data.lock().await.build_uni_packet(
-            UniCommand::OidbSvc,
-            &self.data.lock().await.sig.hb480,
-            None,
-        )?;
-        let request = self
-            .request_sender
-            .send_request(request_packet, None)
-            .await?;
-        match request.await {
-            Ok(_) => {
-                self.retried = 0;
-                self.refresh_token().await?;
+    pub fn on_sso(&self) -> Receiver<(u32, String, Vec<u8>)> {
+        self.sso_tx.subscribe()
+    }
+}
 
-                Ok(())
+impl BaseClient {
+    async fn describe_network_state(&mut self) {
+        let statistics = Arc::clone(&self.statistics);
+        let networker = Arc::clone(&self.networker);
+        let register = Arc::clone(&self.register);
+
+        let mut rx = self.networker.lock().await.on_state();
+        tokio::spawn(async move {
+            while let Ok((state, socket_addr)) = rx.recv().await {
+                let socket_addr_str = socket_addr
+                    .and_then(|socket_addr| Some(socket_addr.to_string()))
+                    .unwrap_or("unknown remote server".to_string());
+
+                let _ = match state {
+                    NetworkState::Closed => {
+                        info!("{} closed", socket_addr_str);
+
+                        statistics.lock().await.remote_socket_addr = None;
+                    }
+                    NetworkState::Lost => {
+                        error!("{} lost", socket_addr_str);
+
+                        statistics.lock().await.lost_times += 1;
+                        networker.lock().await.set_registered(false);
+
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        let _ = register.lock().await.register().await;
+                    }
+                    NetworkState::Connecting => {
+                        info!("connecting...")
+                    }
+                    NetworkState::Connected => {
+                        info!("{} connected", socket_addr_str);
+
+                        statistics.lock().await.remote_socket_addr = socket_addr.clone();
+                    }
+                };
             }
-            Err(_) => {
-                self.retried += 1;
-                error!("heartbeat timeout, retried count: {}", self.retried);
+        });
+    }
 
-                if self.retried >= 2 {
-                    Err(CommonError::new("connection lost"))
-                } else {
-                    self.beat().await
+    async fn describe_network_error(&mut self) {
+        let mut rx = self.networker.lock().await.on_error();
+        tokio::spawn(async move {
+            while let Ok(err) = rx.recv().await {
+                error!("{}", err);
+            }
+        });
+    }
+
+    async fn describe_network_packet(&mut self) {
+        let data = Arc::clone(&self.data);
+        let statistics = Arc::clone(&self.statistics);
+        let networker = Arc::clone(&self.networker);
+        let error_tx = self.error_tx.clone();
+        let sso_tx = self.sso_tx.clone();
+
+        let mut rx = self.networker.lock().await.on_packet();
+        tokio::spawn(async move {
+            let mut z_decompress = Decompress::new(true);
+            while let Ok(packet) = rx.recv().await {
+                statistics.lock().await.recv_pkt_cnt += 1;
+
+                let flag = packet[4];
+                let offset = u32::from_be_bytes(packet[6..10].try_into().unwrap());
+                let encrypted = packet[offset as usize + 6..].to_vec();
+
+                let decrypted = match flag {
+                    0 => encrypted,
+                    1 => match decrypt(&encrypted, &data.lock().await.sig.d2key) {
+                        Ok(decrypted) => decrypted,
+                        Err(err) => {
+                            error!("tea decrypted error: {}", err);
+                            continue;
+                        }
+                    },
+                    2 => match decrypt(&encrypted, &BUF_16) {
+                        Ok(decrypted) => decrypted,
+                        Err(err) => {
+                            error!("tea decrypted error: {}", err);
+                            continue;
+                        }
+                    },
+                    _ => {
+                        let _ = error_tx.send(InternalErrorKind::Token);
+                        error!("unknown flag: {}", flag);
+                        continue;
+                    }
+                };
+
+                match BaseClient::parse_sso(decrypted.as_slice(), &mut z_decompress) {
+                    Ok(sso) => {
+                        debug!("recv: {} seq: {}", sso.1, sso.0);
+
+                        if !networker
+                            .lock()
+                            .await
+                            .response_a_request(sso.0, sso.2)
+                            .await
+                        {
+                            let _ = sso_tx.send((sso.0, sso.1, packet));
+                        }
+                    }
+                    Err(err) => {
+                        let _ = error!("sso parsec error: {}", err);
+                    }
+                };
+            }
+        });
+    }
+
+    fn parse_sso(
+        buf: &[u8],
+        z_decompress: &mut Decompress,
+    ) -> Result<(u32, String, Vec<u8>), CommonError> {
+        let head_len = u32::from_be_bytes(buf[..4].try_into().unwrap()) as usize;
+        let seq = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+        let retcode = i32::from_be_bytes(buf[8..12].try_into().unwrap());
+
+        if retcode != 0 {
+            Err(CommonError::new(format!(
+                "unsuccessful retcode: {}",
+                retcode
+            )))
+        } else {
+            let mut offset = u32::from_be_bytes(buf[12..4].try_into().unwrap()) as usize + 12;
+            let len = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+            let cmd =
+                String::from_utf8(buf.get(offset + 4..offset + len).unwrap().to_vec()).unwrap();
+            offset += len;
+            let len = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += len;
+            let flag = i32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
+
+            let payload = match flag {
+                0 => buf[head_len + 4..].to_vec(),
+                1 => {
+                    let mut decompressed = Vec::with_capacity(buf[head_len + 4..].len() + 100);
+                    match z_decompress.decompress_vec(
+                        &buf[head_len + 4..],
+                        &mut decompressed,
+                        flate2::FlushDecompress::Finish,
+                    ) {
+                        Ok(status) => match status {
+                            flate2::Status::Ok => decompressed,
+                            flate2::Status::BufError => {
+                                return Err(CommonError::new("decompress buf error"))
+                            }
+                            flate2::Status::StreamEnd => {
+                                return Err(CommonError::new("decompress stream error"))
+                            }
+                        },
+                        Err(err) => return Err(CommonError::from(err)),
+                    }
                 }
-            }
+                8 => buf[head_len..].to_vec(),
+                _ => {
+                    return Err(CommonError::new(format!(
+                        "unknown compressed flag: {}",
+                        flag
+                    )));
+                }
+            };
+
+            Ok((seq, cmd, payload))
         }
+    }
+}
+
+impl BaseClient {}
+
+impl BaseClient {}
+
+impl AsRef<BaseClient> for BaseClient {
+    fn as_ref(&self) -> &BaseClient {
+        self
+    }
+}
+
+impl AsMut<BaseClient> for BaseClient {
+    fn as_mut(&mut self) -> &mut BaseClient {
+        self
     }
 }
 
@@ -515,7 +646,7 @@ impl Data {
         next
     }
 
-    fn build_common_packet<B>(
+    fn build_request<B>(
         &mut self,
         command: LoginCommand,
         body: B,
@@ -606,7 +737,7 @@ impl Data {
         Ok(LoginRequest::new(seq, command, result))
     }
 
-    fn build_uni_packet<B>(
+    fn build_uni_request<B>(
         &mut self,
         command: UniCommand,
         body: B,
@@ -643,6 +774,82 @@ impl Data {
         payload.write_bytes(encrypt)?;
 
         Ok(UniRequest::new(seq, command, payload))
+    }
+
+    fn build_register_request(&mut self, logout: bool) -> Result<LoginRequest, CommonError> {
+        let pb_buf = protobuf::encode(&ProtobufObject::from([(
+            1,
+            ProtobufElement::from([
+                ProtobufElement::Object(ProtobufObject::from([
+                    (1, ProtobufElement::from(46)),
+                    (
+                        2,
+                        ProtobufElement::from(current_unix_timestamp_as_secs() as i64),
+                    ),
+                ])),
+                ProtobufElement::Object(ProtobufObject::from([
+                    (1, ProtobufElement::from(283)),
+                    (2, ProtobufElement::from(0)),
+                ])),
+            ]),
+        )]))?;
+
+        let d = &self.device;
+        let svc_req_register = jce::encode(&JceObject::try_from([
+            Some(JceElement::from(self.uin as i64)),
+            Some(JceElement::from(logout.then_some(0).unwrap_or(7))),
+            Some(JceElement::from(0)),
+            Some(JceElement::from("")),
+            Some(JceElement::from(logout.then_some(21).unwrap_or(11))),
+            Some(JceElement::from(0)),
+            Some(JceElement::from(0)),
+            Some(JceElement::from(0)),
+            Some(JceElement::from(0)),
+            Some(JceElement::from(0)),
+            Some(JceElement::from(logout.then_some(44).unwrap_or(0))),
+            Some(JceElement::from(d.version.sdk as i64)),
+            Some(JceElement::from(1)),
+            Some(JceElement::from("")),
+            Some(JceElement::from(0)),
+            None,
+            Some(JceElement::from(d.guid)),
+            Some(JceElement::from(2052)),
+            Some(JceElement::from(0)),
+            Some(JceElement::from(d.model)),
+            Some(JceElement::from(d.model)),
+            Some(JceElement::from(d.version.release)),
+            Some(JceElement::from(1)),
+            Some(JceElement::from(0)),
+            Some(JceElement::from(0)),
+            None,
+            Some(JceElement::from(0)),
+            Some(JceElement::from(0)),
+            Some(JceElement::from("")),
+            Some(JceElement::from(0)),
+            Some(JceElement::from(d.brand)),
+            Some(JceElement::from(d.brand)),
+            Some(JceElement::from("")),
+            Some(JceElement::from(pb_buf)),
+            Some(JceElement::from(0)),
+            None,
+            Some(JceElement::from(0)),
+            None,
+            Some(JceElement::from(1000)),
+            Some(JceElement::from(98)),
+        ])?)?;
+        let body = jce::encode_wrapper(
+            [("SvcReqRegister", svc_req_register)],
+            "PushService",
+            "SvcReqRegister",
+            None,
+        )?;
+        let pkt = self.build_request(
+            LoginCommand::StatSvcRegister,
+            body,
+            Some(CommandType::Type1),
+        )?;
+
+        Ok(pkt)
     }
 
     fn decode_t119<B>(&mut self, t119: B) -> Result<User, CommonError>
@@ -712,28 +919,58 @@ impl Data {
     }
 }
 #[derive(Debug)]
-struct Requester {
-    network: Arc<Mutex<Network>>,
-    polling_requests: Arc<Mutex<HashMap<u32, Weak<Mutex<Option<Vec<u8>>>>>>>,
-
+struct Networker {
     statistics: Arc<Mutex<Statistics>>,
+    network: Network,
+    polling_requests: HashMap<u32, Weak<Mutex<Option<Vec<u8>>>>>,
+    registered: AtomicBool,
+
+    error_tx: Sender<InternalErrorKind>,
 }
 
-impl Requester {
-    fn new(
-        statistics: Arc<Mutex<Statistics>>,
-        network: Arc<Mutex<Network>>,
-        polling_requests: Arc<Mutex<HashMap<u32, Weak<Mutex<Option<Vec<u8>>>>>>>,
-    ) -> Self {
+impl Networker {
+    fn new(statistics: Arc<Mutex<Statistics>>, error_tx: Sender<InternalErrorKind>) -> Self {
         Self {
             statistics,
-            network,
-            polling_requests,
+            network: Network::new(),
+            polling_requests: HashMap::new(),
+            registered: AtomicBool::new(false),
+            error_tx,
         }
     }
 
+    fn on_packet(&self) -> Receiver<Vec<u8>> {
+        self.network.on_packet()
+    }
+
+    fn on_state(&self) -> Receiver<(NetworkState, Option<SocketAddr>)> {
+        self.network.on_state()
+    }
+
+    fn on_error(&self) -> Receiver<CommonError> {
+        self.network.on_error()
+    }
+
+    async fn connect(&mut self) -> Result<(), CommonError> {
+        self.network.connect().await
+    }
+
+    async fn disconnect(&mut self) -> Result<(), CommonError> {
+        self.network.disconnect().await
+    }
+
+    fn registered(&self) -> bool {
+        self.registered.load(Ordering::Relaxed)
+    }
+
+    fn set_registered(&mut self, registered: bool) {
+        self.registered.store(registered, Ordering::Relaxed);
+    }
+}
+
+impl Networker {
     /// 等待返回结果
-    pub async fn send_request<B>(
+    async fn send_request<B>(
         &mut self,
         request_packet: B,
         timeout: Option<Duration>,
@@ -747,35 +984,81 @@ impl Requester {
             response: Arc::new(Mutex::new(None)),
         };
         let response = Arc::downgrade(&request.response);
-        self.polling_requests
-            .lock()
-            .await
-            .insert(request_packet.seq(), response);
+        self.polling_requests.insert(request_packet.seq(), response);
         self.write_request(request_packet).await?;
 
         Ok(request)
     }
 
     /// 不等待返回结果
-    pub async fn write_request<B>(&mut self, request_packet: B) -> Result<(), CommonError>
+    async fn write_request<B>(&mut self, request: B) -> Result<(), CommonError>
     where
         B: Request,
     {
-        self.network
-            .lock()
-            .await
-            .send_bytes(request_packet.payload())
-            .await?;
+        self.network.send_bytes(request.payload()).await?;
 
         self.statistics.lock().await.sent_pkt_cnt += 1;
 
-        debug!(
-            "send: {} seq: {}",
-            request_packet.command(),
-            request_packet.seq()
-        );
+        debug!("send: {} seq: {}", request.command(), request.seq());
 
         Ok(())
+    }
+    async fn send_register(
+        &mut self,
+        request: LoginRequest,
+        refresh: bool,
+    ) -> Result<bool, CommonError> {
+        self.set_registered(false);
+
+        let request = self
+            .send_request(request, Some(Duration::from_secs(10)))
+            .await?;
+        let response = request.await?;
+
+        let rsp = jce::decode_wrapper(&mut response.as_slice())?;
+        if let JceElement::StructBegin(value) = rsp {
+            let result = value
+                .get(&9)
+                .ok_or(CommonError::illegal_data())
+                .and_then(|e| {
+                    if let JceElement::Int8(e) = e {
+                        Ok(e)
+                    } else {
+                        Err(CommonError::illegal_data())
+                    }
+                })
+                .and_then(|e| if *e != 0 { Ok(true) } else { Ok(false) })?;
+
+            if !result && !refresh {
+                let _ = self.error_tx.send(InternalErrorKind::Token);
+                Ok(false)
+            } else {
+                self.set_registered(true);
+                // let heartbeat = Heartbeater::new(Arc::clone(&self.da), networker, token_tx)
+                Ok(true)
+            }
+        } else {
+            Err(CommonError::illegal_data())
+        }
+    }
+
+    async fn send_unregister(&mut self, request: LoginRequest) -> Result<(), CommonError> {
+        self.set_registered(false);
+        self.write_request(request).await?;
+        Ok(())
+    }
+
+    async fn response_a_request(&mut self, seq: u32, payload: Vec<u8>) -> bool {
+        if let Some(packet) = self
+            .polling_requests
+            .remove(&seq)
+            .and_then(|packet| packet.upgrade())
+        {
+            *packet.lock().await = Some(payload);
+            true
+        } else {
+            false
+        }
     }
 
     // /// 发送一个业务包但不等待返回
@@ -820,417 +1103,227 @@ impl Requester {
 }
 
 #[derive(Debug)]
-pub struct BaseClient {
+struct Registry {
     data: Arc<Mutex<Data>>,
-    statistics: Arc<Mutex<Statistics>>,
-
-    registered: Arc<AtomicBool>,
-    network: Arc<Mutex<Network>>,
-    polling_requests: Arc<Mutex<HashMap<u32, Weak<Mutex<Option<Vec<u8>>>>>>>,
+    networker: Arc<Mutex<Networker>>,
     heartbeat_handler: Option<JoinHandle<()>>,
 
-    error_tx: Sender<InternalErrorKind>,
-    sso_tx: Sender<(u32, String, Vec<u8>)>,
+    token_tx: Sender<Vec<u8>>,
 }
 
-impl BaseClient {
-    pub async fn new(uin: u32, platform: Platform, d: Option<ShortDevice>) -> Self {
-        let statistics = Arc::new(Mutex::new(Statistics::new()));
-        let mut instance = Self {
-            data: Arc::new(Mutex::new(Data::new(uin, platform, d))),
-            statistics,
-
-            registered: Arc::new(AtomicBool::new(false)),
-            network: Arc::new(Mutex::new(Network::new())),
-            polling_requests: Arc::new(Mutex::new(HashMap::new())),
+impl Registry {
+    fn new(
+        data: Arc<Mutex<Data>>,
+        networker: Arc<Mutex<Networker>>,
+        token_tx: Sender<Vec<u8>>,
+    ) -> Self {
+        Self {
+            data,
+            networker,
+            token_tx,
             heartbeat_handler: None,
-
-            error_tx: sync::broadcast::channel(1).0,
-            sso_tx: sync::broadcast::channel(1).0,
-        };
-
-        instance.describe_network_error().await;
-        instance.describe_network_state().await;
-        instance.describe_network_packet().await;
-
-        instance
-    }
-
-    pub async fn default(uin: u32) -> Self {
-        Self::new(uin, Platform::Android, None).await
-    }
-}
-
-impl BaseClient {
-    pub async fn data(&self) -> MutexGuard<Data> {
-        self.data.lock().await
-    }
-
-    pub fn on_error(&self) -> Receiver<InternalErrorKind> {
-        self.error_tx.subscribe()
-    }
-
-    pub fn on_sso(&self) -> Receiver<(u32, String, Vec<u8>)> {
-        self.sso_tx.subscribe()
-    }
-}
-
-impl BaseClient {
-    async fn describe_network_error(&mut self) {
-        let mut rx = self.network.lock().await.on_error();
-        tokio::spawn(async move {
-            while let Ok(err) = rx.recv().await {
-                error!("{}", err.to_string());
-            }
-        });
-    }
-
-    async fn describe_network_state(&mut self) {
-        let statistics = Arc::clone(&self.statistics);
-
-        let mut rx = self.network.lock().await.on_state();
-        tokio::spawn(async move {
-            while let Ok((state, socket_addr)) = rx.recv().await {
-                let socket_addr_str = socket_addr
-                    .and_then(|socket_addr| Some(socket_addr.to_string()))
-                    .unwrap_or("unknown remote server".to_string());
-
-                let _ = match state {
-                    NetworkState::Closed => {
-                        statistics.lock().await.remote_socket_addr = None;
-
-                        info!("{} closed", socket_addr_str);
-                    }
-                    NetworkState::Lost => {
-                        statistics.lock().await.lost_times += 1;
-
-                        error!("{} lost", socket_addr_str);
-                    }
-                    NetworkState::Connecting => {
-                        info!("connecting...")
-                    }
-                    NetworkState::Connected => {
-                        statistics.lock().await.remote_socket_addr = socket_addr.clone();
-
-                        info!("{} connected", socket_addr_str);
-                    }
-                };
-            }
-        });
-    }
-
-    fn parse_sso(
-        buf: &[u8],
-        z_decompress: &mut Decompress,
-    ) -> Result<(u32, String, Vec<u8>), CommonError> {
-        let head_len = u32::from_be_bytes(buf[..4].try_into().unwrap()) as usize;
-        let seq = u32::from_be_bytes(buf[4..8].try_into().unwrap());
-        let retcode = i32::from_be_bytes(buf[8..12].try_into().unwrap());
-
-        if retcode != 0 {
-            Err(CommonError::new(format!(
-                "unsuccessful retcode: {}",
-                retcode
-            )))
-        } else {
-            let mut offset = u32::from_be_bytes(buf[12..4].try_into().unwrap()) as usize + 12;
-            let len = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
-            let cmd =
-                String::from_utf8(buf.get(offset + 4..offset + len).unwrap().to_vec()).unwrap();
-            offset += len;
-            let len = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
-            offset += len;
-            let flag = i32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
-
-            let payload = match flag {
-                0 => buf[head_len + 4..].to_vec(),
-                1 => {
-                    let mut decompressed = Vec::with_capacity(buf[head_len + 4..].len() + 100);
-                    match z_decompress.decompress_vec(
-                        &buf[head_len + 4..],
-                        &mut decompressed,
-                        flate2::FlushDecompress::Finish,
-                    ) {
-                        Ok(status) => match status {
-                            flate2::Status::Ok => decompressed,
-                            flate2::Status::BufError => {
-                                return Err(CommonError::new("decompress buf error"))
-                            }
-                            flate2::Status::StreamEnd => {
-                                return Err(CommonError::new("decompress stream error"))
-                            }
-                        },
-                        Err(err) => return Err(CommonError::from(err)),
-                    }
-                }
-                8 => buf[head_len..].to_vec(),
-                _ => {
-                    return Err(CommonError::new(format!(
-                        "unknown compressed flag: {}",
-                        flag
-                    )));
-                }
-            };
-
-            Ok((seq, cmd, payload))
         }
     }
 
-    async fn describe_network_packet(&mut self) {
-        let data = Arc::clone(&self.data);
-        let statistics = Arc::clone(&self.statistics);
-        let polling_requests = Arc::clone(&self.polling_requests);
-
-        let mut rx = self.network.lock().await.on_packet();
-        let error_tx = self.error_tx.clone();
-        let sso_tx = self.sso_tx.clone();
-        tokio::spawn(async move {
-            let mut z_decompress = Decompress::new(true);
-            while let Ok(packet) = rx.recv().await {
-                statistics.lock().await.recv_pkt_cnt += 1;
-
-                let flag = packet[4];
-                let offset = u32::from_be_bytes(packet[6..10].try_into().unwrap());
-                let encrypted = packet[offset as usize + 6..].to_vec();
-
-                let decrypted = match flag {
-                    0 => encrypted,
-                    1 => match decrypt(&encrypted, &data.lock().await.sig.d2key) {
-                        Ok(decrypted) => decrypted,
-                        Err(err) => {
-                            error!("tea decrypted error: {}", err);
-                            continue;
-                        }
-                    },
-                    2 => match decrypt(&encrypted, &BUF_16) {
-                        Ok(decrypted) => decrypted,
-                        Err(err) => {
-                            error!("tea decrypted error: {}", err);
-                            continue;
-                        }
-                    },
-                    _ => {
-                        let _ = error_tx.send(InternalErrorKind::Token);
-                        error!("unknown flag: {}", flag);
-                        continue;
-                    }
-                };
-
-                match BaseClient::parse_sso(decrypted.as_slice(), &mut z_decompress) {
-                    Ok(sso) => {
-                        debug!("recv: {} seq: {}", sso.0, sso.1);
-
-                        if let Some(packet) = polling_requests
-                            .lock()
-                            .await
-                            .remove(&sso.0)
-                            .and_then(|packet| packet.upgrade())
-                        {
-                            *packet.lock().await = Some(sso.2);
-                        } else {
-                            let _ = sso_tx.send((sso.0, sso.1, packet));
-                        }
-                    }
-                    Err(err) => {
-                        let _ = error!("sso parsec error: {}", err);
-                    }
-                };
-            }
-        });
-    }
-}
-
-impl BaseClient {
-    pub async fn register(
-        &mut self,
-        logout: Option<bool>,
-        refresh: Option<bool>,
-    ) -> Result<(), CommonError> {
-        let logout = logout.unwrap_or(false);
-        let refresh = refresh.unwrap_or(false);
-
-        self.registered.store(false, Ordering::Relaxed);
-        self.stop_heartbeat().await;
-
-        let pb_buf = protobuf::encode(&ProtobufObject::from([(
-            1,
-            ProtobufElement::from([
-                ProtobufElement::Object(ProtobufObject::from([
-                    (1, ProtobufElement::from(46)),
-                    (
-                        2,
-                        ProtobufElement::from(current_unix_timestamp_as_secs() as i64),
-                    ),
-                ])),
-                ProtobufElement::Object(ProtobufObject::from([
-                    (1, ProtobufElement::from(283)),
-                    (2, ProtobufElement::from(0)),
-                ])),
-            ]),
-        )]))?;
-
-        let data = self.data().await;
-        let d = &data.device;
-        let svc_req_register = jce::encode(&JceObject::try_from([
-            Some(JceElement::from(data.uin as i64)),
-            Some(JceElement::from(logout.then_some(0).unwrap_or(7))),
-            Some(JceElement::from(0)),
-            Some(JceElement::from("")),
-            Some(JceElement::from(logout.then_some(21).unwrap_or(11))),
-            Some(JceElement::from(0)),
-            Some(JceElement::from(0)),
-            Some(JceElement::from(0)),
-            Some(JceElement::from(0)),
-            Some(JceElement::from(0)),
-            Some(JceElement::from(logout.then_some(44).unwrap_or(0))),
-            Some(JceElement::from(d.version.sdk as i64)),
-            Some(JceElement::from(1)),
-            Some(JceElement::from("")),
-            Some(JceElement::from(0)),
-            None,
-            Some(JceElement::from(d.guid)),
-            Some(JceElement::from(2052)),
-            Some(JceElement::from(0)),
-            Some(JceElement::from(d.model)),
-            Some(JceElement::from(d.model)),
-            Some(JceElement::from(d.version.release)),
-            Some(JceElement::from(1)),
-            Some(JceElement::from(0)),
-            Some(JceElement::from(0)),
-            None,
-            Some(JceElement::from(0)),
-            Some(JceElement::from(0)),
-            Some(JceElement::from("")),
-            Some(JceElement::from(0)),
-            Some(JceElement::from(d.brand)),
-            Some(JceElement::from(d.brand)),
-            Some(JceElement::from("")),
-            Some(JceElement::from(pb_buf)),
-            Some(JceElement::from(0)),
-            None,
-            Some(JceElement::from(0)),
-            None,
-            Some(JceElement::from(1000)),
-            Some(JceElement::from(98)),
-        ])?)?;
-        let body = jce::encode_wrapper(
-            [("SvcReqRegister", svc_req_register)],
-            "PushService",
-            "SvcReqRegister",
-            None,
-        )?;
-        drop(data);
-
-        let pkt = self.data().await.build_common_packet(
-            LoginCommand::StatSvcRegister,
-            body,
-            Some(CommandType::Type1),
-        )?;
-
-        let mut request_sender = Requester::from(self.as_ref());
-        if logout {
-            request_sender.write_request(pkt).await?;
-
-            Ok(())
-        } else {
-            let request = request_sender
-                .send_request(pkt, Some(Duration::from_secs(10)))
-                .await?;
-            let response = request.await?;
-
-            let rsp = jce::decode_wrapper(&mut response.as_slice())?;
-            if let JceElement::StructBegin(value) = rsp {
-                let result = value
-                    .get(&9)
-                    .ok_or(CommonError::illegal_data())
-                    .and_then(|e| {
-                        if let JceElement::Int8(e) = e {
-                            Ok(e)
-                        } else {
-                            Err(CommonError::illegal_data())
-                        }
-                    })
-                    .and_then(|e| if *e != 0 { Ok(true) } else { Ok(false) })?;
-
-                if !result && !refresh {
-                    let _ = self.error_tx.send(InternalErrorKind::Token);
-                } else {
-                    self.registered.store(true, Ordering::Relaxed);
-                    self.start_heartbeat().await;
-                }
-
-                Ok(())
-            } else {
-                Err(CommonError::illegal_data())
-            }
+    async fn register(&mut self) -> Result<(), CommonError> {
+        if self.networker.lock().await.registered() {
+            return Ok(());
         }
-    }
 
-    pub async fn connect(&mut self) -> Result<(), CommonError> {
-        self.network.lock().await.connect().await
-    }
-
-    pub async fn disconnect(&mut self) -> Result<(), CommonError> {
-        self.network.lock().await.disconnect().await
-    }
-}
-
-impl BaseClient {
-    async fn start_heartbeat(&mut self) {
-        // 如果存在一个已有的异步线程，首先关闭
-        self.stop_heartbeat().await;
-
-        let mut time_synchronizer = Heartbeater::from(self.as_ref());
-        let network = Arc::clone(&self.network);
-        let registered = Arc::clone(&self.registered);
-        self.heartbeat_handler = Some(tokio::spawn(async move {
-            while registered.load(Ordering::Relaxed) {
-                match time_synchronizer.beat().await {
-                    Ok(_) => todo!(),
-                    Err(_) => {
-                        registered.store(false, Ordering::Relaxed);
-                        let _ = network.lock().await.disconnect().await;
-                        error!("heartbeat failure, disconnected.");
-                        break;
-                    }
-                }
-            }
-        }));
-    }
-
-    async fn stop_heartbeat(&mut self) {
         if let Some(handler) = self.heartbeat_handler.take() {
             handler.abort();
             let _ = handler.await;
         }
+
+        let request = self.data.lock().await.build_register_request(false)?;
+        let registered = self
+            .networker
+            .lock()
+            .await
+            .send_register(request, false)
+            .await?;
+        if registered {
+            let heartbeater = Heartbeater::new(
+                Arc::clone(&self.data),
+                Arc::clone(&self.networker),
+                self.token_tx.clone(),
+            );
+            self.heartbeat_handler = Some(heartbeater.start_heartbeat());
+        }
+
+        Ok(())
+    }
+
+    async fn unregister(&mut self) -> Result<(), CommonError> {
+        if !self.networker.lock().await.registered() {
+            return Ok(());
+        }
+
+        if let Some(handler) = self.heartbeat_handler.take() {
+            handler.abort();
+            let _ = handler.await;
+        };
+
+        let request = self.data.lock().await.build_register_request(true)?;
+        self.networker.lock().await.send_unregister(request).await?;
+        Ok(())
     }
 }
 
-impl AsRef<BaseClient> for BaseClient {
-    fn as_ref(&self) -> &BaseClient {
-        self
-    }
+#[derive(Debug)]
+struct Heartbeater {
+    retried: u8,
+    data: Arc<Mutex<Data>>,
+    networker: Arc<Mutex<Networker>>,
+    token_tx: Sender<Vec<u8>>,
 }
 
-impl AsMut<BaseClient> for BaseClient {
-    fn as_mut(&mut self) -> &mut BaseClient {
-        self
+impl Heartbeater {
+    fn new(
+        data: Arc<Mutex<Data>>,
+        networker: Arc<Mutex<Networker>>,
+        token_tx: Sender<Vec<u8>>,
+    ) -> Self {
+        Self {
+            retried: 0,
+            data,
+            networker,
+            token_tx,
+        }
     }
-}
 
-impl From<&BaseClient> for Requester {
-    fn from(c: &BaseClient) -> Self {
-        Self::new(
-            Arc::clone(&c.statistics),
-            Arc::clone(&c.network),
-            Arc::clone(&c.polling_requests),
-        )
+    fn start_heartbeat(mut self) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            while self.networker.lock().await.registered() {
+                match self.beat().await {
+                    Ok(_) => tokio::time::sleep(Duration::from_secs(1)).await,
+                    Err(_) => break,
+                }
+            }
+
+            self.networker.lock().await.set_registered(false);
+            let _ = self.networker.lock().await.disconnect().await;
+            error!("heartbeat failure, disconnected.");
+        })
     }
-}
 
-impl From<&BaseClient> for Heartbeater {
-    fn from(c: &BaseClient) -> Self {
-        Self::new(Arc::clone(&c.data), Requester::from(c))
+    async fn sync_time_diff(&mut self) -> Result<(), CommonError> {
+        let request_packet = self.data.lock().await.build_request(
+            LoginCommand::ClientCorrectTime,
+            BUF_4,
+            Some(CommandType::Type0),
+        )?;
+        let request = self
+            .networker
+            .lock()
+            .await
+            .send_request(request_packet, None)
+            .await?;
+        let response = request.await?;
+
+        // 此处忽略错误
+        if let Ok(server_time) = (&mut response.as_slice()).read_i32() {
+            self.data.lock().await.sig.time_diff =
+                server_time as i64 - current_unix_timestamp_as_secs() as i64;
+        }
+
+        Ok(())
+    }
+
+    async fn refresh_token(&mut self) -> Result<(), CommonError> {
+        let mut data = self.data.lock().await;
+
+        if current_unix_timestamp_as_secs() - data.sig.emp_time < 14000 {
+            return Ok(());
+        }
+
+        let mut body = Vec::with_capacity(2000);
+        body.write_u16(11)?;
+        body.write_u16(16)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x100)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x10a)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x116)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x144)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x143)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x142)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x154)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x18)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x141)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x8)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x147)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x177)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x187)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x188)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x202)?)?;
+        body.write_bytes(tlv::pack_tlv(&data, 0x511)?)?;
+        let packet = data.build_request(LoginCommand::WtLoginExchangeEmp, body, None)?;
+        drop(data);
+
+        let request = self
+            .networker
+            .lock()
+            .await
+            .send_request(packet, None)
+            .await?;
+        let response = request.await?;
+
+        let decrypted = tea::decrypt(&response[16..], &self.data.lock().await.ecdh.share_key)?;
+        let r#type = decrypted[2];
+        let mut t = (&mut &decrypted[5..]).read_tlv()?;
+        if r#type == 0 {
+            let t119 = t
+                .remove(&0x119)
+                .ok_or(CommonError::new("tag 0x119 not existed"))?;
+            let user = self.data.lock().await.decode_t119(t119)?;
+
+            let request = self.data.lock().await.build_register_request(false)?;
+            let registered = self
+                .networker
+                .lock()
+                .await
+                .send_register(request, true)
+                .await?;
+
+            if registered {
+                let _ = self.token_tx.send(user.token);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[async_recursion]
+    async fn beat(&mut self) -> Result<(), CommonError> {
+        self.sync_time_diff().await?;
+
+        let request_packet = self.data.lock().await.build_uni_request(
+            UniCommand::OidbSvc,
+            &self.data.lock().await.sig.hb480,
+            None,
+        )?;
+        let request = self
+            .networker
+            .lock()
+            .await
+            .send_request(request_packet, None)
+            .await?;
+        match request.await {
+            Ok(_) => {
+                self.retried = 0;
+                self.refresh_token().await?;
+                Ok(())
+            }
+            Err(_) => {
+                self.retried += 1;
+                error!("heartbeat timeout, retried count: {}", self.retried);
+
+                if self.retried >= 2 {
+                    Err(CommonError::new("connection lost"))
+                } else {
+                    self.beat().await
+                }
+            }
+        }
     }
 }
 
@@ -1238,28 +1331,20 @@ impl From<&BaseClient> for Heartbeater {
 mod tests {
     use std::time::Duration;
 
-    use log::info;
-
-    use crate::core::error::CommonError;
+    use crate::{core::error::CommonError, init_logger};
 
     use super::BaseClient;
-
-    fn init_logger() {
-        let _ = env_logger::builder()
-            .filter_level(log::LevelFilter::Trace)
-            .is_test(true)
-            .try_init();
-    }
 
     #[tokio::test]
     async fn test() -> Result<(), CommonError> {
         init_logger();
 
-        let mut base_client = BaseClient::default(1313).await;
+        let base_client = BaseClient::default(1313).await;
 
-        base_client.connect().await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        base_client.disconnect().await?;
+        base_client.networker.lock().await.connect().await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        base_client.networker.lock().await.disconnect().await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         drop(base_client);
 
         Ok(())

@@ -194,12 +194,7 @@ impl Network {
             // 断开 tcp 之后 peer_addr 会返回 None，因此需要提前拿出来
             let remote_addr = reader.peer_addr().ok();
 
-            let state = state;
-            let packet_tx = packet_tx;
-            let state_tx = state_tx;
-            let error_tx = error_tx;
-
-            let mut error = None;
+            let mut e = None;
             let mut buf = Vec::with_capacity(100);
             let mut ready_buf = Vec::<u8>::with_capacity(2000);
 
@@ -221,7 +216,7 @@ impl Network {
                                 match packet_tx.send(packet_buf) {
                                     Ok(_) => {}
                                     Err(err) => {
-                                        error = Some(CommonError::from(err));
+                                        e = Some(CommonError::from(err));
                                         break;
                                     }
                                 }
@@ -229,14 +224,14 @@ impl Network {
                         }
                     }
                     Err(err) => {
-                        error = Some(CommonError::from(err));
+                        e = Some(CommonError::from(err));
                         break;
                     }
                 }
             }
 
-            if let Some(err) = error {
-                error_tx.send(err).unwrap();
+            if let Some(err) = e {
+                let _ = error_tx.send(err);
             }
 
             *state.lock().await = NetworkState::Closed;
