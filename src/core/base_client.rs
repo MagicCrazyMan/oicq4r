@@ -951,20 +951,20 @@ impl Networker {
         self.network.on_error()
     }
 
-    async fn connect(&mut self) -> Result<(), CommonError> {
-        self.network.connect().await
-    }
-
-    async fn disconnect(&mut self) -> Result<(), CommonError> {
-        self.network.disconnect().await
-    }
-
     fn registered(&self) -> bool {
         self.registered.load(Ordering::Relaxed)
     }
 
     fn set_registered(&mut self, registered: bool) {
         self.registered.store(registered, Ordering::Relaxed);
+    }
+
+    async fn connect(&mut self) -> Result<(), CommonError> {
+        self.network.connect().await
+    }
+
+    async fn disconnect(&mut self) -> Result<(), CommonError> {
+        self.network.disconnect().await
     }
 }
 
