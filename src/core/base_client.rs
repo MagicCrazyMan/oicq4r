@@ -972,22 +972,22 @@ impl Networker {
     /// 等待返回结果
     async fn send_request<B>(
         &mut self,
-        request_packet: B,
+        request: B,
         timeout: Option<Duration>,
     ) -> Result<Response, CommonError>
     where
         B: Request,
     {
-        let request = Response {
+        let response = Response {
             timeout: timeout.unwrap_or(Duration::from_secs(5)),
             start: Instant::now(),
             response: Arc::new(Mutex::new(None)),
         };
-        let response = Arc::downgrade(&request.response);
-        self.polling_requests.insert(request_packet.seq(), response);
-        self.write_request(request_packet).await?;
+        self.polling_requests
+            .insert(request.seq(), Arc::downgrade(&response.response));
+        self.write_request(request).await?;
 
-        Ok(request)
+        Ok(response)
     }
 
     /// 不等待返回结果
@@ -1003,6 +1003,7 @@ impl Networker {
 
         Ok(())
     }
+
     async fn send_register(
         &mut self,
         request: LoginRequest,
@@ -1061,43 +1062,29 @@ impl Networker {
         }
     }
 
-    // /// 发送一个业务包但不等待返回
-    // pub async fn write_uni(
-    //     &mut self,
-    //     request_packet: UniRequestPacket,
-    //     seq: Option<u32>,
-    // ) -> Result<(), CommonError> {
-    //     self.network
-    //         .lock()
-    //         .await
-    //         .send_bytes(request_packet.payload())
-    //         .await?;
+    /// 发送一个业务包但不等待返回
+    pub async fn write_uni(&mut self, request: UniRequest) -> Result<(), CommonError> {
+        if !self.registered() {
+            return Err(CommonError::new("not register"));
+        }
 
-    //     self.data.lock().await.statistics.sent_pkt_cnt += 1;
-    //     Ok(())
-    // }
+        self.write_request(request).await?;
+        Ok(())
+    }
 
-    // /// 发送一个业务包并等待返回结果
-    // pub async fn send_uni<B: AsRef<[u8]>>(
-    //     &mut self,
-    //     command: UniCommand,
-    //     body: B,
-    //     timeout: Option<Duration>,
-    // ) -> Result<Request, CommonError> {
-    //     if self.is_online.load(Ordering::Relaxed) {
-    //         let payload = self.data().await.build_uni_packet(command, body, None)?;
-    //         let request = self
-    //             .network
-    //             .lock()
-    //             .await
-    //             .send_request(payload, timeout)
-    //             .await?;
-    //         self.data().await.statistics.sent_pkt_cnt += 1;
-    //         Ok(request)
-    //     } else {
-    //         Err(CommonError::new("not online"))
-    //     }
-    // }
+    /// 发送一个业务包并等待返回结果
+    pub async fn send_uni(
+        &mut self,
+        request: UniRequest,
+        timeout: Option<Duration>,
+    ) -> Result<Response, CommonError> {
+        if !self.registered() {
+            return Err(CommonError::new("not register"));
+        }
+
+        let response = self.send_request(request, timeout).await?;
+        Ok(response)
+    }
 
     // async fn send_login_request(&mut self, cmd: Command, body: &[u8]) {}
 }
