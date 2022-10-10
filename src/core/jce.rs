@@ -158,11 +158,11 @@ impl From<i64> for JceElement {
     fn from(value: i64) -> Self {
         if value == 0 {
             Self::Zero
-        } else if value >= i8::MIN as i64 && value <= i8::MAX as i64 {
+        } else if value >= -0x80 && value <= 0x7f {
             Self::Int8(value as i8)
-        } else if value >= i16::MIN as i64 && value <= i16::MAX as i64 {
+        } else if value >= -0x8000 && value <= 0x7fff {
             Self::Int16(value as i16)
-        } else if value >= i32::MIN as i64 && value <= i32::MAX as i64 {
+        } else if value >= -0x80000000 && value <= 0x7fffffff {
             Self::Int32(value as i32)
         } else {
             Self::Int64(value)
@@ -462,21 +462,21 @@ where
     stream.read_exact(&mut buf)?;
 
     let head = buf[0];
-    let r#type = Type::try_from(head & 0xf)?;
+    let typee = Type::try_from(head & 0xf)?;
     let mut tag = (head & 0xf0) >> 4;
     if tag == 0xf {
         stream.read_exact(&mut buf)?;
         tag = buf[0];
     }
 
-    Ok((tag, r#type))
+    Ok((tag, typee))
 }
 
-fn read_body<R>(stream: &mut R, r#type: Type) -> Result<JceElement, JceError>
+fn read_body<R>(stream: &mut R, typee: Type) -> Result<JceElement, JceError>
 where
     R: Read,
 {
-    match r#type {
+    match typee {
         Type::Int8 => {
             let mut buf = [0; 1];
             stream.read_exact(&mut buf)?;
@@ -596,20 +596,20 @@ fn read_element<R>(stream: &mut R) -> Result<(u8, JceElement), JceError>
 where
     R: Read,
 {
-    let (tag, r#type) = read_head(stream)?;
-    let element = read_body(stream, r#type)?;
+    let (tag, typee) = read_head(stream)?;
+    let element = read_body(stream, typee)?;
     Ok((tag, element))
 }
 
-fn create_head<W>(stream: &mut W, tag: u8, r#type: Type) -> Result<(), JceError>
+fn create_head<W>(stream: &mut W, tag: u8, typee: Type) -> Result<(), JceError>
 where
     W: Write,
 {
-    let r#type = r#type as u8;
+    let typee = typee as u8;
     if tag < 15 {
-        stream.write_bytes([(tag << 4) | r#type])?;
+        stream.write_bytes([(tag << 4) | typee])?;
     } else {
-        stream.write_bytes([0xf0 | r#type, tag])?;
+        stream.write_bytes([0xf0 | typee, tag])?;
     }
 
     Ok(())
@@ -638,7 +638,7 @@ where
         JceElement::SimpleList(value) => {
             create_head(stream, 0, Type::Int8)?; // 仅占位，没有实际意义
             create_element(stream, 0, &JceElement::from(value.len() as i64))?;
-            stream.write_bytes(value)?
+            stream.write_bytes(value)?;
         }
         JceElement::List(value) => {
             create_element(stream, 0, &JceElement::from(value.len() as i64))?;
@@ -774,6 +774,13 @@ pub fn encode(object: &JceObject) -> Result<Vec<u8>, JceError> {
     encode_with_capacity(object, 50)
 }
 
+pub fn encode_nested(object: JceObject) -> Result<Vec<u8>, JceError> {
+    encode(&JceObject::from([(
+        0,
+        JceElement::StructBegin(object),
+    )]))
+}
+
 pub fn encode_wrapper<K, V, M>(
     map: M,
     servant: &str,
@@ -832,7 +839,86 @@ where
 
 #[cfg(test)]
 mod test {
+    use crate::core::{
+        helper::current_unix_timestamp_as_secs,
+        jce,
+        protobuf::{self, ProtobufElement, ProtobufObject},
+    };
+
     use super::*;
+
+    #[test]
+    fn test_register() {
+        let logout = false;
+        let pb_buf = protobuf::encode(&ProtobufObject::from([(
+            1,
+            ProtobufElement::from([
+                ProtobufElement::Object(ProtobufObject::from([
+                    (1, ProtobufElement::from(46)),
+                    (
+                        2,
+                        ProtobufElement::from(current_unix_timestamp_as_secs() as i64),
+                    ),
+                ])),
+                ProtobufElement::Object(ProtobufObject::from([
+                    (1, ProtobufElement::from(283)),
+                    (2, ProtobufElement::from(0)),
+                ])),
+            ]),
+        )]))
+        .unwrap();
+
+        assert_eq!(17, pb_buf.len());
+
+        let svc_req_register = jce::encode_nested(
+            JceObject::try_from([
+                Some(JceElement::from(640279992)),
+                Some(JceElement::from(logout.then_some(0).unwrap_or(7))),
+                Some(JceElement::from(0)),
+                Some(JceElement::from("")),
+                Some(JceElement::from(logout.then_some(21).unwrap_or(11))),
+                Some(JceElement::from(0)),
+                Some(JceElement::from(0)),
+                Some(JceElement::from(0)),
+                Some(JceElement::from(0)),
+                Some(JceElement::from(0)),
+                Some(JceElement::from(logout.then_some(44).unwrap_or(0))),
+                Some(JceElement::from(29)),
+                Some(JceElement::from(1)),
+                Some(JceElement::from("")),
+                Some(JceElement::from(0)),
+                None,
+                Some(JceElement::from(rand::random::<[u8; 16]>())),
+                Some(JceElement::from(2052)),
+                Some(JceElement::from(0)),
+                Some(JceElement::from("Konata 2020")),
+                Some(JceElement::from("Konata 2020")),
+                Some(JceElement::from("10")),
+                Some(JceElement::from(1)),
+                Some(JceElement::from(0)),
+                Some(JceElement::from(0)),
+                None,
+                Some(JceElement::from(0)),
+                Some(JceElement::from(0)),
+                Some(JceElement::from("")),
+                Some(JceElement::from(0)),
+                Some(JceElement::from("OICQX")),
+                Some(JceElement::from("OICQX")),
+                Some(JceElement::from("")),
+                Some(JceElement::from(pb_buf)),
+                Some(JceElement::from(0)),
+                None,
+                Some(JceElement::from(0)),
+                None,
+                Some(JceElement::from(1000)),
+                Some(JceElement::from(98)),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(155, svc_req_register.len());
+    }
 
     #[test]
     fn test() -> Result<(), JceError> {

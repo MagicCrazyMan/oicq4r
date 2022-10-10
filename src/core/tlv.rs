@@ -25,33 +25,45 @@ impl<T: AsRef<str>> PartialSlice for T {
     }
 }
 
-fn pack_body<W: Write>(
-    writer: &mut W,
+fn pack_body(
     data: &DataCenter,
     tag: u16,
     emp: Option<u32>,
     md5_password: Option<[u8; 16]>,
     code: Option<Vec<u8>>,
     ticket: Option<Vec<u8>>,
-) -> Result<(), CommonError> {
-    match tag {
+) -> Result<Vec<u8>, CommonError> {
+    let result = match tag {
         0x01 => {
+            let mut writer = Vec::with_capacity(2 + 4 + 4 + 4 + 4 + 2);
             writer.write_u16(1)?;
             writer.write_bytes(&rand::random::<[u8; 4]>())?;
             writer.write_u32(data.uin)?;
             writer.write_u32(current_unix_timestamp_as_millis() as u32)?;
             writer.write_bytes(BUF_4)?;
             writer.write_u16(0)?;
-            Ok(())
+            writer
         }
         0x08 => {
+            let mut writer = Vec::with_capacity(2 + 4 + 2);
             writer.write_u16(0)?;
             writer.write_u32(2052)?;
             writer.write_u16(0)?;
-            Ok(())
+            writer
         }
         0x16 => {
             let apk = Platform::watch();
+            let mut writer = Vec::with_capacity(
+                4 + 4
+                    + 4
+                    + data.device.guid.len()
+                    + 2
+                    + apk.id.len()
+                    + 2
+                    + apk.ver.len()
+                    + 2
+                    + apk.sign.len(),
+            );
             writer.write_u32(7)?;
             writer.write_u32(apk.appid)?;
             writer.write_u32(apk.subid)?;
@@ -59,9 +71,10 @@ fn pack_body<W: Write>(
             writer.write_tlv(apk.id)?;
             writer.write_tlv(apk.ver)?;
             writer.write_tlv(apk.sign)?;
-            Ok(())
+            writer
         }
         0x18 => {
+            let mut writer = Vec::with_capacity(2 + 4 + 4 + 4 + 4 + 2 + 2);
             writer.write_u16(1)?;
             writer.write_u32(1536)?;
             writer.write_u32(data.apk.appid)?;
@@ -69,9 +82,10 @@ fn pack_body<W: Write>(
             writer.write_u32(data.uin)?;
             writer.write_u16(0)?;
             writer.write_u16(0)?;
-            Ok(())
+            writer
         }
         0x1B => {
+            let mut writer = Vec::with_capacity(4 * 7 + 2);
             writer.write_u32(0)?;
             writer.write_u32(0)?;
             writer.write_u32(3)?;
@@ -80,17 +94,19 @@ fn pack_body<W: Write>(
             writer.write_u32(2)?;
             writer.write_u32(2)?;
             writer.write_u16(0)?;
-            Ok(())
+            writer
         }
         0x1D => {
+            let mut writer = Vec::with_capacity(1 + 4 + 4 + 1 + 4);
             writer.write_u8(1)?;
             writer.write_u32(184024956)?;
             writer.write_u32(0)?;
             writer.write_u8(0)?;
             writer.write_u32(0)?;
-            Ok(())
+            writer
         }
         0x1F => {
+            let mut writer = Vec::with_capacity(1 + 2 + 7 + 2 + 5 + 2 + 2 + 16 + 2 + 0 + 2 + 4);
             writer.write_u8(0)?;
             writer.write_tlv("android")?;
             writer.write_tlv("7.1.2")?;
@@ -98,32 +114,26 @@ fn pack_body<W: Write>(
             writer.write_tlv("China Mobile GSM")?;
             writer.write_tlv(BUF_0)?;
             writer.write_tlv("wifi")?;
-            Ok(())
+            writer
         }
-        0x33 => {
-            writer.write_bytes(data.device.guid)?;
-            Ok(())
-        }
-        0x35 => {
-            writer.write_u32(8)?;
-            Ok(())
-        }
+        0x33 => data.device.guid.to_vec(),
+        0x35 => 8u32.to_be_bytes().to_vec(),
         0x100 => {
+            let mut writer = Vec::with_capacity(2 + 5 * 4);
             writer.write_u16(1)?;
             writer.write_u32(7)?;
             writer.write_u32(data.apk.appid)?;
             writer.write_u32(if emp.is_some() { 2 } else { data.apk.subid })?;
             writer.write_u32(0)?;
             writer.write_u32(data.apk.sigmap)?;
-            Ok(())
+            writer
         }
-        0x104 => {
-            writer.write_bytes(&data.sig.t104)?;
-            Ok(())
-        }
+        0x104 => data.sig.t104.clone(),
         0x106 => {
             let md5_password = md5_password.ok_or(CommonError::new("no password provided"))?;
-            let mut body = Vec::with_capacity(100);
+            let mut body = Vec::with_capacity(
+                2 + 4 + 4 + 4 + 4 + 8 + 4 + 4 + 1 + 16 + 16 + 4 + 1 + 16 + 4 + 4 + 2 + 4 + 2 + 24,
+            );
             body.write_u16(4)?;
             body.write_bytes(rand::random::<[u8; 4]>())?;
             body.write_u32(7)?;
@@ -151,42 +161,42 @@ fn pack_body<W: Write>(
 
             body.extend(key);
             let encrypted = tea::encrypt(body, &key)?;
+
+            let mut writer = Vec::with_capacity(encrypted.len());
             writer.write_bytes(encrypted)?;
-            Ok(())
+            writer
         }
         0x107 => {
+            let mut writer = Vec::with_capacity(2 + 1 + 2 + 1);
             writer.write_u16(0)?;
             writer.write_u8(0)?;
             writer.write_u16(0)?;
             writer.write_u8(1)?;
-            Ok(())
+            writer
         }
-        0x109 => {
-            writer.write_bytes(md5::compute(&data.device.imei).0)?;
-            Ok(())
-        }
-        0x10a => {
-            writer.write_bytes(&data.sig.tgt)?;
-            Ok(())
-        }
+        0x109 => md5::compute(&data.device.imei).0.to_vec(),
+        0x10a => data.sig.tgt.clone(),
         0x116 => {
+            let mut writer = Vec::with_capacity(1 + 4 + 4 + 1 + 4);
             writer.write_u8(0)?;
             writer.write_u32(data.apk.bitmap)?;
             writer.write_u32(0x10400)?;
             writer.write_u8(1)?;
             writer.write_u32(1600000226)?;
-            Ok(())
+            writer
         }
         0x124 => {
+            let mut writer = Vec::with_capacity(2 + 16 + 2 + 16 + 2 + 2 + 16 + 2 + 2 + 16);
             writer.write_tlv(&data.device.os_type.partial_slice(16))?;
             writer.write_tlv(&data.device.version.release.partial_slice(16))?;
             writer.write_u16(2)?;
             writer.write_tlv(&data.device.sim.partial_slice(16))?;
             writer.write_u16(0)?;
             writer.write_tlv(&data.device.apn.partial_slice(16))?;
-            Ok(())
+            writer
         }
         0x128 => {
+            let mut writer = Vec::with_capacity(2 + 1 + 1 + 1 + 4 + 2 + 32 + 2 + 16 + 2 + 16);
             writer.write_u16(0)?;
             writer.write_u8(0)?;
             writer.write_u8(1)?;
@@ -195,106 +205,83 @@ fn pack_body<W: Write>(
             writer.write_tlv(&data.device.model.partial_slice(32))?;
             writer.write_tlv(&data.device.guid)?;
             writer.write_tlv(&data.device.brand.partial_slice(16))?;
-            Ok(())
+            writer
         }
         0x141 => {
+            let mut writer =
+                Vec::with_capacity(2 + 2 + data.device.sim.len() + 2 + 2 + data.device.apn.len());
             writer.write_u16(1)?;
             writer.write_tlv(data.device.sim)?;
             writer.write_u16(2)?;
             writer.write_tlv(data.device.apn)?;
-            Ok(())
+            writer
         }
         0x142 => {
+            let mut writer = Vec::with_capacity(2 + 2 + 32);
             writer.write_u16(0)?;
             writer.write_tlv(&data.apk.id.partial_slice(32))?;
-            Ok(())
+            writer
         }
-        0x143 => {
-            writer.write_bytes(&data.sig.d2)?;
-            Ok(())
-        }
+        0x143 => data.sig.d2.clone(),
         0x144 => {
-            let mut body = Vec::with_capacity(200);
+            let a = pack(data, 0x109)?;
+            let b = pack(data, 0x52d)?;
+            let c = pack(data, 0x124)?;
+            let d = pack(data, 0x128)?;
+            let e = pack(data, 0x16e)?;
+            let mut body = Vec::with_capacity(2 + a.len() + b.len() + c.len() + d.len() + e.len());
             body.write_u16(5)?;
-            body.write_bytes(pack(data, 0x109)?)?;
-            body.write_bytes(pack(data, 0x52d)?)?;
-            body.write_bytes(pack(data, 0x124)?)?;
-            body.write_bytes(pack(data, 0x128)?)?;
-            body.write_bytes(pack(data, 0x16e)?)?;
+            body.write_bytes(a)?;
+            body.write_bytes(b)?;
+            body.write_bytes(c)?;
+            body.write_bytes(d)?;
+            body.write_bytes(e)?;
 
-            writer.write_bytes(encrypt(body, &data.sig.tgtgt)?)?;
-            Ok(())
+            encrypt(body, &data.sig.tgtgt)?
         }
-        0x145 => {
-            writer.write_bytes(data.device.guid)?;
-            Ok(())
-        }
+        0x145 => data.device.guid.to_vec(),
         0x147 => {
+            let mut writer = Vec::with_capacity(4 + 2 + 5 + 2 + data.apk.sign.len());
             writer.write_u32(data.apk.appid)?;
             writer.write_tlv(&data.apk.ver.partial_slice(5))?;
             writer.write_tlv(data.apk.sign)?;
-            Ok(())
+            writer
         }
-        0x154 => {
-            writer.write_u32(data.sig.seq + 1)?;
-            Ok(())
-        }
-        0x16e => {
-            writer.write_bytes(data.device.model)?;
-            Ok(())
-        }
-        0x174 => {
-            writer.write_bytes(&data.sig.t174)?;
-            Ok(())
-        }
+        0x154 => (data.sig.seq + 1).to_be_bytes().to_vec(),
+        0x16e => data.device.model.as_bytes().to_vec(),
+        0x174 => data.sig.t174.clone(),
         0x177 => {
+            let mut writer = Vec::with_capacity(1 + 4 + 2 + data.apk.sdkver.len());
             writer.write_u8(0x01)?;
             writer.write_u32(data.apk.buildtime)?;
             writer.write_tlv(data.apk.sdkver)?;
-            Ok(())
+            writer
         }
-        0x17a => {
-            writer.write_u32(9)?;
-            Ok(())
-        }
+        0x17a => 9u32.to_be_bytes().to_vec(),
         0x17c => {
-            writer.write_tlv(code.unwrap())?;
-            Ok(())
+            let code = code.ok_or(CommonError::new("code not provided"))?;
+            let mut writer = Vec::with_capacity(2 + code.len());
+            writer.write_tlv(code)?;
+            writer
         }
-        0x187 => {
-            writer.write_bytes(md5::compute(&data.device.mac_address).0)?;
-            Ok(())
-        }
-        0x188 => {
-            writer.write_bytes(md5::compute(&data.device.android_id).0)?;
-            Ok(())
-        }
-        0x191 => {
-            writer.write_u8(0x82)?;
-            Ok(())
-        }
-        0x193 => {
-            writer.write_bytes(ticket.unwrap())?;
-            Ok(())
-        }
-        0x194 => {
-            writer.write_bytes(data.device.imsi)?;
-            Ok(())
-        }
-        0x197 => {
+        0x187 => md5::compute(&data.device.mac_address).0.to_vec(),
+        0x188 => md5::compute(&data.device.android_id).0.to_vec(),
+        0x191 => 0x82u8.to_be_bytes().to_vec(),
+        0x193 => ticket.ok_or(CommonError::new("ticket not provided"))?,
+        0x194 => data.device.imsi.to_vec(),
+        0x197 | 0x198 => {
+            let mut writer = Vec::with_capacity(2 + 1);
             writer.write_tlv(BUF_1)?;
-            Ok(())
-        }
-        0x198 => {
-            writer.write_tlv(BUF_1)?;
-            Ok(())
+            writer
         }
         0x202 => {
+            let mut writer = Vec::with_capacity(2 + 16 + 2 + 32);
             writer.write_tlv(&data.device.wifi_bssid.partial_slice(16))?;
             writer.write_tlv(&data.device.wifi_ssid.partial_slice(32))?;
-            Ok(())
+            writer
         }
         0x400 => {
+            let mut writer = Vec::with_capacity(2 + 8 + 16 + 16 + 4 + 4 + 4 + 0);
             writer.write_u16(1)?;
             writer.write_u64(data.uin as u64)?;
             writer.write_bytes(data.device.guid)?;
@@ -303,12 +290,9 @@ fn pack_body<W: Write>(
             writer.write_i32(16)?;
             writer.write_u32(current_unix_timestamp_as_millis() as u32)?;
             writer.write_bytes(BUF_0)?;
-            Ok(())
+            writer
         }
-        0x401 => {
-            writer.write_bytes(rand::random::<[u8; 16]>())?;
-            Ok(())
-        }
+        0x401 => rand::random::<[u8; 16]>().to_vec(),
         0x511 => {
             let domains = [
                 "aq.qq.com",
@@ -332,27 +316,23 @@ fn pack_body<W: Write>(
                 "vip.qq.com",
                 "y.qq.com",
             ];
+
+            let mut writer = Vec::with_capacity(2 + 20 * 3 + 189);
             writer.write_u16(domains.len() as u16)?;
             domains.iter().try_for_each(|domain| {
                 writer.write_u8(0x01)?;
                 writer.write_tlv(domain)
             })?;
-            Ok(())
+            writer
         }
-        0x516 => {
-            writer.write_u32(0)?;
-            Ok(())
-        }
-        0x521 => {
-            writer.write_u32(0)?;
-            writer.write_u16(0)?;
-            Ok(())
-        }
+        0x516 => 0u32.to_be_bytes().to_vec(),
+        0x521 => vec![0, 0, 0, 0, 0, 0],
         0x525 => {
+            let mut writer = Vec::with_capacity(2 + 2 + 2 + 2);
             writer.write_u16(1)?;
             writer.write_u16(0x536)?;
             writer.write_tlv([0x1, 0x0])?;
-            Ok(())
+            writer
         }
         0x52d => {
             let device = &data.device;
@@ -368,11 +348,12 @@ fn pack_body<W: Write>(
                 (9, ProtobufElement::from(device.version.incremental as i64)),
             ]))?;
 
-            writer.write_bytes(&buf)?;
-            Ok(())
+            buf
         }
-        _ => Err(CommonError::from("Invalid Input")),
-    }
+        _ => return Err(CommonError::from("Invalid Input")),
+    };
+
+    Ok(result)
 }
 
 pub fn pack(data: &DataCenter, tag: u16) -> Result<Vec<u8>, CommonError> {
@@ -387,8 +368,7 @@ pub fn pack_with_args(
     code: Option<Vec<u8>>,
     ticket: Option<Vec<u8>>,
 ) -> Result<Vec<u8>, CommonError> {
-    let mut body = Vec::with_capacity(512);
-    pack_body(&mut body, data, tag, emp, md5_password, code, ticket)?;
+    let mut body = pack_body(data, tag, emp, md5_password, code, ticket)?;
 
     let a = (body.len() as u16).to_be_bytes();
     let b = tag.to_be_bytes();

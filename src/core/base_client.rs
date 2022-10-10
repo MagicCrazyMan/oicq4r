@@ -963,7 +963,7 @@ impl DataCenter {
         )]))?;
 
         let d = &self.device;
-        let svc_req_register = jce::encode(&JceObject::try_from([
+        let svc_req_register = jce::encode_nested(JceObject::try_from([
             Some(JceElement::from(self.uin as i64)),
             Some(JceElement::from(logout.then_some(0).unwrap_or(7))),
             Some(JceElement::from(0)),
