@@ -1,23 +1,29 @@
-use hyper::{body::to_bytes, Body, Client, Request};
+use flate2::Decompress;
+use hyper::{body::to_bytes, Body, Client};
 use hyper_tls::HttpsConnector;
+use log::debug;
 use std::{
     borrow::BorrowMut,
-    net::SocketAddr,
-    sync::Arc,
-    time::{Duration, SystemTime},
+    collections::HashMap,
+    future::Future,
+    io::{Cursor, Read, Seek, SeekFrom, Write},
+    net::{Shutdown, SocketAddr, TcpStream},
+    pin::Pin,
+    sync::{Arc, Weak},
+    task::{Context, Poll, Waker},
+    time::{Duration, Instant, SystemTime},
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpStream,
-    },
-    sync::{self, Mutex},
-    task::JoinHandle,
+use tokio::sync::{
+    broadcast::{self, Sender},
+    Mutex,
 };
 
+use crate::core::helper::BUF_16;
+
 use super::{
+    base_client::{DataCenter, Statistics},
     error::CommonError,
+    io::ReadExt,
     jce::{decode_wrapper, encode_wrapper, JceElement},
     tea::{decrypt, encrypt},
 };
@@ -36,6 +42,160 @@ static UPDATE_SEVER_REQUEST: [(&str, [u8; 45]); 1] = [(
     ],
 )];
 
+pub trait Request {
+    fn seq(&self) -> u32;
+
+    fn command(&self) -> &str;
+
+    fn payload(&self) -> &[u8];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginCommand {
+    WtLoginLogin,
+    WtLoginExchangeEmp,
+    WtLoginTransEmp,
+    StatSvcRegister,
+    ClientCorrectTime,
+}
+
+impl AsRef<str> for LoginCommand {
+    fn as_ref(&self) -> &str {
+        match self {
+            LoginCommand::WtLoginLogin => "wtlogin.login",
+            LoginCommand::WtLoginExchangeEmp => "wtlogin.exchange_emp",
+            LoginCommand::WtLoginTransEmp => "wtlogin.trans_emp",
+            LoginCommand::StatSvcRegister => "StatSvc.register",
+            LoginCommand::ClientCorrectTime => "Client.CorrectTime",
+        }
+    }
+}
+
+pub struct LoginRequest {
+    seq: u32,
+    command: LoginCommand,
+    payload: Vec<u8>,
+}
+
+impl LoginRequest {
+    pub fn new(seq: u32, command: LoginCommand, payload: Vec<u8>) -> Self {
+        Self {
+            seq,
+            command,
+            payload,
+        }
+    }
+}
+
+impl Request for LoginRequest {
+    fn seq(&self) -> u32 {
+        self.seq
+    }
+
+    fn command(&self) -> &str {
+        self.command.as_ref()
+    }
+
+    fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UniCommand {
+    OidbSvc,
+}
+
+impl AsRef<str> for UniCommand {
+    fn as_ref(&self) -> &str {
+        match self {
+            UniCommand::OidbSvc => "OidbSvc.0x480_9_IMCore",
+        }
+    }
+}
+
+pub struct UniRequest {
+    seq: u32,
+    command: UniCommand,
+    payload: Vec<u8>,
+}
+
+impl UniRequest {
+    pub fn new(seq: u32, command: UniCommand, payload: Vec<u8>) -> Self {
+        Self {
+            seq,
+            command,
+            payload,
+        }
+    }
+}
+
+impl Request for UniRequest {
+    fn seq(&self) -> u32 {
+        self.seq
+    }
+
+    fn command(&self) -> &str {
+        self.command.as_ref()
+    }
+
+    fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+#[derive(Debug)]
+struct Polling {
+    body: Option<Vec<u8>>,
+    waker: Option<Waker>,
+}
+
+impl Polling {
+    fn new() -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            body: None,
+            waker: None,
+        }))
+    }
+}
+
+#[derive(Debug)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct Response {
+    timeout: Duration,
+    start: Instant,
+    polling: Arc<Mutex<Polling>>,
+}
+
+impl Future for Response {
+    type Output = Result<Vec<u8>, CommonError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.start.elapsed() >= self.timeout {
+            Poll::Ready(Err(CommonError::new("request timeout")))
+        } else {
+            if let Ok(mut polling) = self.polling.try_lock() {
+                if let Some(body) = polling.body.take() {
+                    Poll::Ready(Ok(body))
+                } else {
+                    polling.waker = Some(cx.waker().clone());
+
+                    let waker = cx.waker().clone();
+                    let timeout = self.timeout;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(timeout).await;
+                        waker.wake_by_ref();
+                    });
+
+                    Poll::Pending
+                }
+            } else {
+                Poll::Ready(Err(CommonError::new("request locked")))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkState {
     Closed,
@@ -47,47 +207,55 @@ pub enum NetworkState {
 
 #[derive(Debug)]
 pub struct Network {
-    tcp_writer: Arc<Mutex<Option<OwnedWriteHalf>>>,
-    tcp_reader_handler: Option<JoinHandle<()>>,
+    data: Arc<Mutex<DataCenter>>,
+    statistics: Arc<Mutex<Statistics>>,
+
+    tcp_writer: Arc<Mutex<Option<TcpStream>>>,
+    tcp_reader_handler: Option<std::thread::JoinHandle<()>>,
     state: Arc<Mutex<NetworkState>>,
     close_manually: Arc<Mutex<bool>>,
+    polling_requests: Arc<Mutex<HashMap<u32, Weak<Mutex<Polling>>>>>,
 
     server_last_update_time: Option<SystemTime>,
     server_list: Vec<(String, u16)>,
     auto_search: bool,
 
-    state_tx: sync::broadcast::Sender<(NetworkState, Option<SocketAddr>)>,
-    error_tx: sync::broadcast::Sender<CommonError>,
-    packet_tx: sync::broadcast::Sender<Vec<u8>>,
+    state_tx: broadcast::Sender<(NetworkState, Option<SocketAddr>)>,
+    error_tx: broadcast::Sender<CommonError>,
+    sso_tx: broadcast::Sender<(u32, String, Vec<u8>)>,
 }
 
 impl Network {
-    pub fn new() -> Self {
+    pub fn new(data: Arc<Mutex<DataCenter>>, statistics: Arc<Mutex<Statistics>>) -> Self {
         Self {
+            data,
+            statistics,
+
             tcp_writer: Arc::new(Mutex::new(None)),
             tcp_reader_handler: None,
             state: Arc::new(Mutex::new(NetworkState::Closed)),
             close_manually: Arc::new(Mutex::new(false)),
+            polling_requests: Arc::new(Mutex::new(HashMap::new())),
 
             server_last_update_time: None,
             server_list: vec![],
             auto_search: true,
 
-            state_tx: sync::broadcast::channel(1).0,
-            error_tx: sync::broadcast::channel(1).0,
-            packet_tx: sync::broadcast::channel(1).0,
+            state_tx: broadcast::channel(1).0,
+            error_tx: broadcast::channel(1).0,
+            sso_tx: broadcast::channel(1).0,
         }
     }
 
-    pub fn on_error(&self) -> sync::broadcast::Receiver<CommonError> {
+    pub fn on_error(&self) -> broadcast::Receiver<CommonError> {
         self.error_tx.subscribe()
     }
 
-    pub fn on_packet(&self) -> sync::broadcast::Receiver<Vec<u8>> {
-        self.packet_tx.subscribe()
+    pub fn on_sso(&self) -> broadcast::Receiver<(u32, String, Vec<u8>)> {
+        self.sso_tx.subscribe()
     }
 
-    pub fn on_state(&self) -> sync::broadcast::Receiver<(NetworkState, Option<SocketAddr>)> {
+    pub fn on_state(&self) -> broadcast::Receiver<(NetworkState, Option<SocketAddr>)> {
         self.state_tx.subscribe()
     }
 
@@ -102,22 +270,20 @@ impl Network {
 
             // 更新状态至 Connecting
             *self.state.lock().await = NetworkState::Connecting;
-            self.state_tx.send((NetworkState::Connecting, None))?;
+            let _ = self.state_tx.send((NetworkState::Connecting, None));
 
             // 使用尝试连接服务器
-            let tcp = TcpStream::connect(self.resolve_target_sevrer().await?).await?;
+            let tcp = TcpStream::connect(self.resolve_target_sevrer().await?)?;
             let target_server = tcp.peer_addr().ok();
 
-            let (readable, writeable) = tcp.into_split();
             // 保留 tcp 写入流
-            *self.tcp_writer.lock().await = Some(writeable);
+            *self.tcp_writer.lock().await = Some(tcp.try_clone().unwrap());
             // 使用读取流持续读取内容
-            self.tcp_reader_handler = Some(self.describe_packets_receiving(readable));
+            self.tcp_reader_handler = Some(self.describe_packets_receiving(tcp));
 
-            // 更新状态至 Connected
+            // 等待完成初始化后更新状态至 Connected
             *self.state.lock().await = NetworkState::Connected;
-            self.state_tx
-                .send((NetworkState::Connected, target_server))?;
+            let _ = self.state_tx.send((NetworkState::Connected, target_server));
 
             Ok(())
         } else {
@@ -129,8 +295,8 @@ impl Network {
         if NetworkState::Connected == self.state().await {
             *self.close_manually.lock().await = true;
 
-            if let Some(mut stream) = self.tcp_writer.lock().await.take() {
-                let _ = stream.shutdown().await;
+            if let Some(stream) = self.tcp_writer.lock().await.take() {
+                let _ = stream.shutdown(Shutdown::Both);
             }
             self.tcp_reader_handler = None;
 
@@ -141,13 +307,56 @@ impl Network {
         }
     }
 
-    pub async fn send_bytes<B: AsRef<[u8]>>(&mut self, bytes: B) -> Result<(), CommonError> {
-        let bytes = bytes.as_ref();
+    pub async fn write_request<B: Request>(&mut self, request: B) -> Result<(), CommonError> {
         if NetworkState::Connected == self.state().await {
             let mut writer = self.tcp_writer.lock().await;
             let writer = writer.borrow_mut().as_mut().unwrap();
-            writer.write_all(bytes).await?;
+            writer.write_all(request.payload())?;
+
+            self.statistics.lock().await.sent_pkt_cnt += 1;
+
+            debug!(
+                "sent: {}, seq: {}, len: {}",
+                request.command(),
+                request.seq(),
+                request.payload().len()
+            );
             Ok(())
+        } else {
+            Err(CommonError::new("not connected"))
+        }
+    }
+
+    pub async fn send_request<B: Request>(
+        &mut self,
+        request: B,
+        timeout: Duration,
+    ) -> Result<Response, CommonError> {
+        if NetworkState::Connected == self.state().await {
+            let response = Response {
+                timeout,
+                start: Instant::now(),
+                polling: Polling::new(),
+            };
+            self.polling_requests
+                .lock()
+                .await
+                .insert(request.seq(), Arc::downgrade(&response.polling));
+
+            let mut writer = self.tcp_writer.lock().await;
+            let writer = writer.borrow_mut().as_mut().unwrap();
+            writer.write_all(request.payload())?;
+
+            self.statistics.lock().await.sent_pkt_cnt += 1;
+
+            debug!(
+                "sent: {}, seq: {}, len: {}, timeout: {}s",
+                request.command(),
+                request.seq(),
+                request.payload().len(),
+                timeout.as_secs()
+            );
+            Ok(response)
         } else {
             Err(CommonError::new("not connected"))
         }
@@ -183,43 +392,53 @@ impl Network {
         Ok(target_server)
     }
 
-    fn describe_packets_receiving(&mut self, mut reader: OwnedReadHalf) -> JoinHandle<()> {
+    fn describe_packets_receiving(&mut self, mut reader: TcpStream) -> std::thread::JoinHandle<()> {
+        let data = Arc::clone(&self.data);
+        let statistics = Arc::clone(&self.statistics);
         let state = Arc::clone(&self.state);
+        let polling_requests = Arc::clone(&self.polling_requests);
         let close_manually = Arc::clone(&self.close_manually);
-        let packet_tx = self.packet_tx.clone();
         let state_tx = self.state_tx.clone();
         let error_tx = self.error_tx.clone();
+        let sso_tx = self.sso_tx.clone();
 
-        tokio::spawn(async move {
+        std::thread::spawn(move || {
             // 断开 tcp 之后 peer_addr 会返回 None，因此需要提前拿出来
             let remote_addr = reader.peer_addr().ok();
 
             let mut e = None;
-            let mut buf = Vec::with_capacity(100);
-            let mut ready_buf = Vec::<u8>::with_capacity(2000);
+            let mut buf = [0; 2048];
+            let mut ready_buf = Vec::<u8>::with_capacity(buf.len() * 4);
 
             loop {
-                match reader.read(&mut buf).await {
+                match reader.read(&mut buf) {
                     Ok(len) => {
                         if len == 0 {
                             break;
                         }
 
-                        ready_buf.write_all(&buf[..len]).await.unwrap();
+                        ready_buf.write_all(&buf[..len]).unwrap();
                         while ready_buf.len() > 4 {
                             let len =
                                 u32::from_be_bytes(ready_buf[..4].try_into().unwrap()) as usize;
-                            if ready_buf.len() - 4 >= len {
-                                let packet_buf =
-                                    ready_buf.splice(..4 + len, []).skip(4).collect::<Vec<_>>();
 
-                                match packet_tx.send(packet_buf) {
-                                    Ok(_) => {}
-                                    Err(err) => {
-                                        e = Some(CommonError::from(err));
-                                        break;
-                                    }
+                            if ready_buf.len() >= len {
+                                let packet_buf =
+                                    ready_buf.splice(..len, []).skip(4).collect::<Vec<_>>();
+
+                                statistics.blocking_lock().recv_pkt_cnt += 1;
+
+                                if let Err(err) = decode_packet(
+                                    Arc::clone(&data),
+                                    Arc::clone(&polling_requests),
+                                    sso_tx.clone(),
+                                    packet_buf,
+                                ) {
+                                    e = Some(err);
+                                    break;
                                 }
+                            } else {
+                                break;
                             }
                         }
                     }
@@ -234,12 +453,12 @@ impl Network {
                 let _ = error_tx.send(err);
             }
 
-            *state.lock().await = NetworkState::Closed;
-            state_tx.send((NetworkState::Closed, remote_addr)).unwrap();
+            *state.blocking_lock() = NetworkState::Closed;
+            let _ = state_tx.send((NetworkState::Closed, remote_addr));
 
-            if !*close_manually.lock().await {
-                *state.lock().await = NetworkState::Lost;
-                state_tx.send((NetworkState::Lost, remote_addr)).unwrap();
+            if !*close_manually.blocking_lock() {
+                *state.blocking_lock() = NetworkState::Lost;
+                let _ = state_tx.send((NetworkState::Lost, remote_addr));
             }
         })
     }
@@ -260,7 +479,7 @@ async fn update_server_list() -> Result<Vec<(String, u16)>, CommonError> {
     let client = Client::builder().build::<_, hyper::Body>(HttpsConnector::new());
     let response = client
         .request(
-            Request::builder()
+            hyper::Request::builder()
                 .method("POST")
                 .uri("https://configsvr.msf.3g.qq.com/configsvr/serverlist.jsp?mType=getssolist")
                 .body(Body::from(encrypted_payload))?,
@@ -308,65 +527,169 @@ async fn update_server_list() -> Result<Vec<(String, u16)>, CommonError> {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use std::sync::Arc;
+#[inline]
+fn decode_packet(
+    data: Arc<Mutex<DataCenter>>,
+    polling_requests: Arc<Mutex<HashMap<u32, Weak<Mutex<Polling>>>>>,
+    sso_tx: Sender<(u32, String, Vec<u8>)>,
+    packet: Vec<u8>,
+) -> Result<(), CommonError> {
+    let flag = packet[4];
+    let offset = u32::from_be_bytes(packet[6..10].try_into().unwrap());
+    let encrypted = packet[offset as usize + 6..].to_vec();
 
-    use tokio::{sync::Mutex, task::JoinError};
+    let decrypted = match flag {
+        0 => encrypted,
+        1 => decrypt(&encrypted, &data.blocking_lock().sig.d2key)?,
+        2 => decrypt(&encrypted, &BUF_16)?,
+        _ => {
+            // let _ = error_tx.send(InternalErrorKind::Token);
+            return Err(CommonError::new(format!("unknown flag: {}", flag)));
+        }
+    };
 
-    use crate::core::error::CommonError;
+    let sso = parse_sso(decrypted.as_slice())?;
+    debug!(
+        "recv: {}, seq: {}, raw_len: {}, decoded_len: {}",
+        sso.1,
+        sso.0,
+        packet.len(),
+        sso.2.len()
+    );
 
-    use super::{Network, NetworkState};
+    let mut polling_requests = polling_requests.blocking_lock();
+    if let Some(polling) = polling_requests.remove(&sso.0).and_then(|p| p.upgrade()) {
+        let mut polling = polling.blocking_lock();
+        polling.body = Some(sso.2);
 
-    #[tokio::test]
-    async fn test_resolve() -> Result<(), CommonError> {
-        let mut network = Network::new();
-        let (addr, port) = network.resolve_target_sevrer().await?;
-        let socket_addr = (addr.to_string(), port);
-
-        assert_ne!(network.server_list.len(), 0);
-        assert_eq!(
-            socket_addr,
-            network
-                .server_list
-                .first()
-                .and_then(|(addr, port)| Some((addr.to_string(), *port)))
-                .unwrap()
-        );
-        Ok(())
+        if let Some(waker) = &polling.waker {
+            waker.wake_by_ref();
+        }
+    } else {
+        let _ = sso_tx.send(sso);
     }
 
-    #[tokio::test]
-    async fn test() -> Result<(), JoinError> {
-        let network = Arc::new(Mutex::new(Network::new()));
+    Ok(())
+}
 
-        let mut rx = network.lock().await.on_state();
-        let cloned = Arc::clone(&network);
-        let handler = tokio::spawn(async move {
-            while let Ok((state, _)) = rx.recv().await {
-                match state {
-                    NetworkState::Closed => {
-                        println!("Closed");
-                        break;
-                    }
-                    NetworkState::Lost => {
-                        println!("Closed");
-                        break;
-                    }
-                    NetworkState::Connecting => {
-                        println!("Connecting");
-                    }
-                    NetworkState::Connected => {
-                        println!("Connected");
-                        let _ = cloned.lock().await.disconnect().await;
-                    }
+#[inline]
+fn parse_sso(buf: &[u8]) -> Result<(u32, String, Vec<u8>), CommonError> {
+    let mut z_decompress = Decompress::new(true);
+    let mut reader = Cursor::new(buf);
+    let head_len = reader.read_u32()? as usize;
+    let seq = reader.read_u32()?;
+    let retcode = reader.read_i32()?;
+
+    if retcode != 0 {
+        Err(CommonError::new(format!(
+            "unsuccessful retcode: {}",
+            retcode
+        )))
+    } else {
+        let offset = reader.read_u32()? as i64;
+        reader.seek(SeekFrom::Current(offset - 4))?;
+
+        let len = reader.read_u32()? as usize;
+        let cmd = String::from_utf8(reader.read_bytes(len)?)?;
+
+        reader.seek(SeekFrom::Current(4))?;
+        let flag = reader.read_i32()?;
+
+        let payload = match flag {
+            0 => buf[head_len + 4..].to_vec(),
+            1 => {
+                let mut decompressed = Vec::with_capacity(buf.len() - head_len - 4 + 512);
+                match z_decompress.decompress_vec(
+                    &buf[head_len + 4..],
+                    &mut decompressed,
+                    flate2::FlushDecompress::Finish,
+                ) {
+                    Ok(status) => match status {
+                        flate2::Status::Ok => decompressed,
+                        flate2::Status::BufError => {
+                            return Err(CommonError::new("decompress buf error"))
+                        }
+                        flate2::Status::StreamEnd => {
+                            return Err(CommonError::new("decompress stream error"))
+                        }
+                    },
+                    Err(err) => return Err(CommonError::from(err)),
                 }
             }
-        });
+            8 => buf[head_len..].to_vec(),
+            _ => {
+                return Err(CommonError::new(format!(
+                    "unknown compressed flag: {}",
+                    flag
+                )));
+            }
+        };
 
-        let _ = network.lock().await.connect().await;
-        // drop(network);
-        let _ = handler.await;
-        Ok(())
+        Ok((seq, cmd, payload))
     }
 }
+// #[cfg(test)]
+// mod test {
+//     use std::{sync::Arc, time::Duration};
+
+//     use tokio::{sync::Mutex, task::JoinError};
+
+//     use crate::{core::error::CommonError, init_logger};
+
+//     use super::{Network, NetworkState};
+
+//     #[tokio::test]
+//     async fn test_resolve() -> Result<(), CommonError> {
+//         let mut network = Network::new();
+//         let (addr, port) = network.resolve_target_sevrer().await?;
+//         let socket_addr = (addr.to_string(), port);
+
+//         assert_ne!(network.server_list.len(), 0);
+//         assert_eq!(
+//             socket_addr,
+//             network
+//                 .server_list
+//                 .first()
+//                 .and_then(|(addr, port)| Some((addr.to_string(), *port)))
+//                 .unwrap()
+//         );
+//         Ok(())
+//     }
+
+//     #[tokio::test]
+//     async fn test() -> Result<(), JoinError> {
+//         init_logger();
+
+//         let network = Arc::new(Mutex::new(Network::new()));
+
+//         let mut rx = network.lock().await.on_state();
+//         let cloned = Arc::clone(&network);
+//         let handler = tokio::spawn(async move {
+//             while let Ok((state, _)) = rx.recv().await {
+//                 match state {
+//                     NetworkState::Closed => {
+//                         println!("Closed");
+//                         break;
+//                     }
+//                     NetworkState::Lost => {
+//                         println!("Closed");
+//                         break;
+//                     }
+//                     NetworkState::Connecting => {
+//                         println!("Connecting");
+//                     }
+//                     NetworkState::Connected => {
+//                         println!("Connected");
+//                         let _ = cloned.lock().await.disconnect().await;
+//                     }
+//                 }
+//             }
+//         });
+
+//         let _ = network.lock().await.connect().await;
+//         tokio::time::sleep(Duration::from_secs(2)).await;
+//         let _ = network.lock().await.disconnect().await;
+//         let _ = handler.await;
+//         Ok(())
+//     }
+// }

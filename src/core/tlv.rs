@@ -5,10 +5,10 @@ use std::{
 };
 
 use super::{
-    base_client::Data,
-    helper::{BUF_0, BUF_1},
+    base_client::DataCenter,
     device::Platform,
     error::CommonError,
+    helper::{BUF_0, BUF_1},
     io::WriteExt,
     protobuf::{encode, ProtobufElement, ProtobufObject},
     tea::{self, encrypt},
@@ -23,10 +23,10 @@ fn current_timestamp() -> u128 {
 
 fn pack_body<W: Write>(
     writer: &mut W,
-    data: &Data,
+    data: &DataCenter,
     tag: u16,
     emp: Option<u32>,
-    md5pass: Option<Vec<u8>>,
+    md5_password: Option<[u8; 16]>,
     code: Option<Vec<u8>>,
     ticket: Option<Vec<u8>>,
 ) -> Result<(), CommonError> {
@@ -73,8 +73,8 @@ fn pack_body<W: Write>(
             writer.write_u32(3)?;
             writer.write_u32(4)?;
             writer.write_u32(72)?;
-            writer.write_u16(2)?;
-            writer.write_u16(2)?;
+            writer.write_u32(2)?;
+            writer.write_u32(2)?;
             writer.write_u16(0)?;
             Ok(())
         }
@@ -87,12 +87,12 @@ fn pack_body<W: Write>(
             Ok(())
         }
         0x1F => {
-            writer.write_u8(1)?;
+            writer.write_u8(0)?;
             writer.write_tlv("android")?;
             writer.write_tlv("7.1.2")?;
             writer.write_u16(2)?;
             writer.write_tlv("China Mobile GSM")?;
-            writer.write_tlv([])?;
+            writer.write_tlv(BUF_0)?;
             writer.write_tlv("wifi")?;
             Ok(())
         }
@@ -118,7 +118,7 @@ fn pack_body<W: Write>(
             Ok(())
         }
         0x106 => {
-            let md5pass = md5pass.unwrap();
+            let md5_password = md5_password.ok_or(CommonError::new("no password provided"))?;
             let mut body = Vec::with_capacity(100);
             body.write_u16(4)?;
             body.write_bytes(rand::random::<[u8; 4]>())?;
@@ -129,7 +129,7 @@ fn pack_body<W: Write>(
             body.write_bytes(&current_timestamp().to_be_bytes()[..32])?;
             body.write_bytes([0; 4])?;
             body.write_u8(1)?;
-            body.write_bytes(&md5pass)?;
+            body.write_bytes(&md5_password)?;
             body.write_bytes(data.sig.tgtgt)?;
             body.write_u32(0)?;
             body.write_u8(1)?;
@@ -139,7 +139,8 @@ fn pack_body<W: Write>(
             body.write_tlv(data.uin.to_be_bytes())?;
             body.write_u16(0)?;
 
-            let mut key = md5pass.clone();
+            let mut key = Vec::with_capacity(24);
+            key.extend(md5_password);
             key.extend([0; 4]);
             key.extend(data.uin.to_be_bytes());
             let key = md5::compute(&key).0;
@@ -211,11 +212,11 @@ fn pack_body<W: Write>(
         0x144 => {
             let mut body = Vec::with_capacity(200);
             body.write_u16(5)?;
-            body.write_bytes(pack_tlv(data, 0x109)?)?;
-            body.write_bytes(pack_tlv(data, 0x52d)?)?;
-            body.write_bytes(pack_tlv(data, 0x124)?)?;
-            body.write_bytes(pack_tlv(data, 0x128)?)?;
-            body.write_bytes(pack_tlv(data, 0x16e)?)?;
+            body.write_bytes(pack(data, 0x109)?)?;
+            body.write_bytes(pack(data, 0x52d)?)?;
+            body.write_bytes(pack(data, 0x124)?)?;
+            body.write_bytes(pack(data, 0x128)?)?;
+            body.write_bytes(pack(data, 0x16e)?)?;
 
             writer.write_bytes(encrypt(body, &data.sig.tgtgt)?)?;
             Ok(())
@@ -368,12 +369,25 @@ fn pack_body<W: Write>(
     }
 }
 
-pub fn pack_tlv(data: &Data, tag: u16) -> Result<Vec<u8>, CommonError> {
-    let mut body = Vec::with_capacity(200);
-    pack_body(&mut body, data, tag, None, None, None, None)?;
-    let len = body.len();
-    body.write_u16(len as u16)?;
-    body.write_u16(tag)?;
+pub fn pack(data: &DataCenter, tag: u16) -> Result<Vec<u8>, CommonError> {
+    pack_with_args(data, tag, None, None, None, None)
+}
+
+pub fn pack_with_args(
+    data: &DataCenter,
+    tag: u16,
+    emp: Option<u32>,
+    md5_password: Option<[u8; 16]>,
+    code: Option<Vec<u8>>,
+    ticket: Option<Vec<u8>>,
+) -> Result<Vec<u8>, CommonError> {
+    let mut body = Vec::with_capacity(512);
+    pack_body(&mut body, data, tag, emp, md5_password, code, ticket)?;
+
+    let a = (body.len() as u16).to_be_bytes();
+    let b = tag.to_be_bytes();
+    let append = [b[0], b[1], a[0], a[1]];
+    body.splice(0..0, append);
 
     Ok(body)
 }
@@ -384,7 +398,7 @@ pub trait WriteTlvExt: Write {
         B: AsRef<[u8]>,
     {
         let buf = buf.as_ref();
-        self.write_all(&(buf.len() as u32).to_be_bytes())?;
+        self.write_all(&(buf.len() as u16).to_be_bytes())?;
         self.write_all(buf)?;
 
         Ok(())
@@ -405,10 +419,10 @@ pub trait ReadTlvExt: Read {
                     self.read_exact(&mut len_buf)?;
                     let len = u16::from_be_bytes(len_buf);
 
-                    let mut buf = Vec::with_capacity(len as usize);
+                    let mut buf = vec![0; len as usize];
                     self.read_exact(&mut buf)?;
                     result.insert(tag, buf);
-                },
+                }
                 Err(err) => {
                     if err.kind() == std::io::ErrorKind::UnexpectedEof {
                         break;

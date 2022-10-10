@@ -1,8 +1,9 @@
 use std::{
     collections::HashMap,
     fmt::Display,
+    fs::File,
     future::Future,
-    io::{Read, Write},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     net::SocketAddr,
     pin::Pin,
     sync::{
@@ -26,7 +27,7 @@ use tokio::{
     time::Instant,
 };
 
-use crate::define_observer;
+use crate::{core::network::LoginCommand, define_observer};
 
 use super::{
     device::{FullDevice, Platform, ShortDevice, APK},
@@ -35,7 +36,7 @@ use super::{
     helper::{current_unix_timestamp_as_secs, BUF_0, BUF_16, BUF_4},
     io::{ReadExt, WriteExt},
     jce::{self, JceElement, JceObject},
-    network::{Network, NetworkState},
+    network::{LoginRequest, Network, NetworkState, Request, Response, UniCommand, UniRequest},
     protobuf::{self, ProtobufElement, ProtobufObject},
     tea::{self, decrypt},
     tlv::{self, ReadTlvExt, WriteTlvExt},
@@ -81,7 +82,7 @@ pub struct SIG {
     pub d2key: [u8; 16],
     pub t104: Vec<u8>,
     pub t174: Vec<u8>,
-    pub qrsig: [u8; 0],
+    pub qrsig: Vec<u8>,
     pub bigdata: BigData,
     pub hb480: Vec<u8>,
     pub emp_time: u64,
@@ -108,7 +109,7 @@ impl SIG {
             d2key: [0; 16],
             t104: vec![],
             t174: vec![],
-            qrsig: BUF_0,
+            qrsig: vec![],
             bigdata: BigData::new(),
             hb480,
             emp_time: 0,
@@ -119,15 +120,15 @@ impl SIG {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Statistics {
-    lost_pkt_cnt: usize,
-    lost_times: usize,
-    msg_cnt_per_min: usize,
-    recv_msg_cnt: usize,
-    recv_pkt_cnt: usize,
-    remote_socket_addr: Option<SocketAddr>,
-    sent_msg_cnt: usize,
-    sent_pkt_cnt: usize,
-    start_time: SystemTime,
+    pub lost_pkt_cnt: usize,
+    pub lost_times: usize,
+    pub msg_cnt_per_min: usize,
+    pub recv_msg_cnt: usize,
+    pub recv_pkt_cnt: usize,
+    pub remote_socket_addr: Option<SocketAddr>,
+    pub sent_msg_cnt: usize,
+    pub sent_pkt_cnt: usize,
+    pub start_time: SystemTime,
 }
 
 impl Statistics {
@@ -146,44 +147,6 @@ impl Statistics {
     }
 }
 
-impl Statistics {
-    pub fn lost_pkt_cnt(&self) -> usize {
-        self.lost_pkt_cnt
-    }
-
-    pub fn lost_times(&self) -> usize {
-        self.lost_times
-    }
-
-    pub fn msg_cnt_per_min(&self) -> usize {
-        self.msg_cnt_per_min
-    }
-
-    pub fn recv_msg_cnt(&self) -> usize {
-        self.recv_msg_cnt
-    }
-
-    pub fn recv_pkt_cnt(&self) -> usize {
-        self.recv_pkt_cnt
-    }
-
-    pub fn remote_socket_addr(&self) -> Option<SocketAddr> {
-        self.remote_socket_addr
-    }
-
-    pub fn sent_msg_cnt(&self) -> usize {
-        self.sent_msg_cnt
-    }
-
-    pub fn sent_pkt_cnt(&self) -> usize {
-        self.sent_pkt_cnt
-    }
-
-    pub fn start_time(&self) -> SystemTime {
-        self.start_time
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandType {
     Type0 = 0,
@@ -195,6 +158,7 @@ pub enum CommandType {
 pub enum InternalErrorKind {
     Token,
     UnknownLoginType(u8, String),
+    Qrcode(u8, String),
 }
 
 impl std::error::Error for InternalErrorKind {}
@@ -221,167 +185,31 @@ define_observer! {
     (internal_verbose, VerboseListener, (verbose: &str, level: Level))
 }
 
-trait Request {
-    fn seq(&self) -> u32;
-
-    fn command(&self) -> &str;
-
-    fn payload(&self) -> &[u8];
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoginCommand {
-    WtLoginLogin,
-    WtLoginExchangeEmp,
-    WtLoginTransEmp,
-    StatSvcRegister,
-    ClientCorrectTime,
-}
-
-impl AsRef<str> for LoginCommand {
-    fn as_ref(&self) -> &str {
-        match self {
-            LoginCommand::WtLoginLogin => "wtlogin.login",
-            LoginCommand::WtLoginExchangeEmp => "wtlogin.exchange_emp",
-            LoginCommand::WtLoginTransEmp => "wtlogin.trans_emp",
-            LoginCommand::StatSvcRegister => "StatSvc.register",
-            LoginCommand::ClientCorrectTime => "Client.CorrectTime",
-        }
-    }
-}
-
-struct LoginRequest {
-    seq: u32,
-    command: LoginCommand,
-    payload: Vec<u8>,
-}
-
-impl LoginRequest {
-    fn new(seq: u32, command: LoginCommand, payload: Vec<u8>) -> Self {
-        Self {
-            seq,
-            command,
-            payload,
-        }
-    }
-}
-
-impl Request for LoginRequest {
-    fn seq(&self) -> u32 {
-        self.seq
-    }
-
-    fn command(&self) -> &str {
-        self.command.as_ref()
-    }
-
-    fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UniCommand {
-    OidbSvc,
-}
-
-impl AsRef<str> for UniCommand {
-    fn as_ref(&self) -> &str {
-        match self {
-            UniCommand::OidbSvc => "OidbSvc.0x480_9_IMCore",
-        }
-    }
-}
-
-struct UniRequest {
-    seq: u32,
-    command: UniCommand,
-    payload: Vec<u8>,
-}
-
-impl UniRequest {
-    fn new(seq: u32, command: UniCommand, payload: Vec<u8>) -> Self {
-        Self {
-            seq,
-            command,
-            payload,
-        }
-    }
-}
-
-impl Request for UniRequest {
-    fn seq(&self) -> u32 {
-        self.seq
-    }
-
-    fn command(&self) -> &str {
-        self.command.as_ref()
-    }
-
-    fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-}
-#[derive(Debug)]
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct Response {
-    timeout: Duration,
-    start: Instant,
-    response: Arc<Mutex<Option<Vec<u8>>>>,
-}
-
-impl Future for Response {
-    type Output = Result<Vec<u8>, CommonError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.start.elapsed() >= self.timeout {
-            Poll::Ready(Err(CommonError::new("timeout")))
-        } else {
-            match self.response.try_lock() {
-                Ok(mut packet) => match packet.take() {
-                    Some(packet) => return Poll::Ready(Ok(packet)),
-                    None => {}
-                },
-                Err(_) => {}
-            };
-
-            let waker = cx.waker().clone();
-            let timeout = self.timeout;
-            tokio::spawn(async move {
-                tokio::time::sleep(timeout).await;
-                waker.wake_by_ref();
-            });
-
-            Poll::Pending
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct BaseClient {
     statistics: Arc<Mutex<Statistics>>,
-    data: Arc<Mutex<Data>>,
+    data: Arc<Mutex<DataCenter>>,
     networker: Arc<Mutex<Networker>>,
     register: Arc<Mutex<Registry>>,
 
     error_tx: Sender<InternalErrorKind>,
-    sso_tx: Sender<(u32, String, Vec<u8>)>,
     token_tx: Sender<Vec<u8>>,
     online_tx: Sender<User>,
     slider_tx: Sender<String>,
+    qrcode_tx: Sender<Vec<u8>>,
     verify_tx: Sender<(Option<String>, Option<String>)>,
 }
 
 impl BaseClient {
     pub async fn new(uin: u32, platform: Platform, d: Option<ShortDevice>) -> Self {
         let error_tx = sync::broadcast::channel(1).0;
-        let sso_tx = sync::broadcast::channel(1).0;
         let token_tx = sync::broadcast::channel(1).0;
         let online_tx = sync::broadcast::channel(1).0;
         let slider_tx = sync::broadcast::channel(1).0;
+        let qrcode_tx = sync::broadcast::channel(1).0;
         let verify_tx = sync::broadcast::channel(1).0;
 
-        let data = Arc::new(Mutex::new(Data::new(uin, platform, d)));
+        let data = Arc::new(Mutex::new(DataCenter::new(uin, platform, d)));
         let statistics = Arc::new(Mutex::new(Statistics::new()));
         let networker = Arc::new(Mutex::new(Networker::new(
             Arc::clone(&statistics),
@@ -400,14 +228,13 @@ impl BaseClient {
             register,
 
             error_tx,
-            sso_tx,
             token_tx,
             online_tx,
             slider_tx,
+            qrcode_tx,
             verify_tx,
         };
 
-        instance.describe_network_packet().await;
         instance.describe_network_state().await;
         instance.describe_network_error().await;
 
@@ -418,7 +245,15 @@ impl BaseClient {
         Self::new(uin, Platform::Android, None).await
     }
 
-    pub async fn data(&self) -> MutexGuard<Data> {
+    pub async fn connect(&self) -> Result<(), CommonError> {
+        self.networker.lock().await.connect().await
+    }
+
+    pub async fn disconnect(&self) -> Result<(), CommonError> {
+        self.networker.lock().await.disconnect().await
+    }
+
+    pub async fn data(&self) -> MutexGuard<DataCenter> {
         self.data.lock().await
     }
 
@@ -426,8 +261,8 @@ impl BaseClient {
         self.error_tx.subscribe()
     }
 
-    pub fn on_sso(&self) -> Receiver<(u32, String, Vec<u8>)> {
-        self.sso_tx.subscribe()
+    pub async fn on_sso(&self) -> Receiver<(u32, String, Vec<u8>)> {
+        self.networker.lock().await.on_sso()
     }
 }
 
@@ -480,124 +315,6 @@ impl BaseClient {
             }
         });
     }
-
-    async fn describe_network_packet(&mut self) {
-        let data = Arc::clone(&self.data);
-        let statistics = Arc::clone(&self.statistics);
-        let networker = Arc::clone(&self.networker);
-        let error_tx = self.error_tx.clone();
-        let sso_tx = self.sso_tx.clone();
-
-        let mut rx = self.networker.lock().await.on_packet();
-        tokio::spawn(async move {
-            let mut z_decompress = Decompress::new(true);
-            while let Ok(packet) = rx.recv().await {
-                statistics.lock().await.recv_pkt_cnt += 1;
-
-                let flag = packet[4];
-                let offset = u32::from_be_bytes(packet[6..10].try_into().unwrap());
-                let encrypted = packet[offset as usize + 6..].to_vec();
-
-                let decrypted = match flag {
-                    0 => encrypted,
-                    1 => match decrypt(&encrypted, &data.lock().await.sig.d2key) {
-                        Ok(decrypted) => decrypted,
-                        Err(err) => {
-                            error!("tea decrypted error: {}", err);
-                            continue;
-                        }
-                    },
-                    2 => match decrypt(&encrypted, &BUF_16) {
-                        Ok(decrypted) => decrypted,
-                        Err(err) => {
-                            error!("tea decrypted error: {}", err);
-                            continue;
-                        }
-                    },
-                    _ => {
-                        let _ = error_tx.send(InternalErrorKind::Token);
-                        error!("unknown flag: {}", flag);
-                        continue;
-                    }
-                };
-
-                match BaseClient::parse_sso(decrypted.as_slice(), &mut z_decompress) {
-                    Ok(sso) => {
-                        debug!("recv: {} seq: {}", sso.1, sso.0);
-
-                        if !networker
-                            .lock()
-                            .await
-                            .response_a_request(sso.0, sso.2)
-                            .await
-                        {
-                            let _ = sso_tx.send((sso.0, sso.1, packet));
-                        }
-                    }
-                    Err(err) => {
-                        let _ = error!("sso parsec error: {}", err);
-                    }
-                };
-            }
-        });
-    }
-
-    fn parse_sso(
-        buf: &[u8],
-        z_decompress: &mut Decompress,
-    ) -> Result<(u32, String, Vec<u8>), CommonError> {
-        let head_len = u32::from_be_bytes(buf[..4].try_into().unwrap()) as usize;
-        let seq = u32::from_be_bytes(buf[4..8].try_into().unwrap());
-        let retcode = i32::from_be_bytes(buf[8..12].try_into().unwrap());
-
-        if retcode != 0 {
-            Err(CommonError::new(format!(
-                "unsuccessful retcode: {}",
-                retcode
-            )))
-        } else {
-            let mut offset = u32::from_be_bytes(buf[12..4].try_into().unwrap()) as usize + 12;
-            let len = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
-            let cmd =
-                String::from_utf8(buf.get(offset + 4..offset + len).unwrap().to_vec()).unwrap();
-            offset += len;
-            let len = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
-            offset += len;
-            let flag = i32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
-
-            let payload = match flag {
-                0 => buf[head_len + 4..].to_vec(),
-                1 => {
-                    let mut decompressed = Vec::with_capacity(buf[head_len + 4..].len() + 100);
-                    match z_decompress.decompress_vec(
-                        &buf[head_len + 4..],
-                        &mut decompressed,
-                        flate2::FlushDecompress::Finish,
-                    ) {
-                        Ok(status) => match status {
-                            flate2::Status::Ok => decompressed,
-                            flate2::Status::BufError => {
-                                return Err(CommonError::new("decompress buf error"))
-                            }
-                            flate2::Status::StreamEnd => {
-                                return Err(CommonError::new("decompress stream error"))
-                            }
-                        },
-                        Err(err) => return Err(CommonError::from(err)),
-                    }
-                }
-                8 => buf[head_len..].to_vec(),
-                _ => {
-                    return Err(CommonError::new(format!(
-                        "unknown compressed flag: {}",
-                        flag
-                    )));
-                }
-            };
-
-            Ok((seq, cmd, payload))
-        }
-    }
 }
 
 impl BaseClient {
@@ -619,27 +336,76 @@ impl BaseClient {
         let mut body = Vec::with_capacity(400);
         body.write_u16(11)?;
         body.write_u16(16)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x100)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x10a)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x116)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x144)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x143)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x142)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x154)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x18)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x141)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x8)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x147)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x177)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x187)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x188)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x202)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x511)?)?;
-
+        body.write_bytes(tlv::pack(&data, 0x100)?)?;
+        body.write_bytes(tlv::pack(&data, 0x10a)?)?;
+        body.write_bytes(tlv::pack(&data, 0x116)?)?;
+        body.write_bytes(tlv::pack(&data, 0x144)?)?;
+        body.write_bytes(tlv::pack(&data, 0x143)?)?;
+        body.write_bytes(tlv::pack(&data, 0x142)?)?;
+        body.write_bytes(tlv::pack(&data, 0x154)?)?;
+        body.write_bytes(tlv::pack(&data, 0x18)?)?;
+        body.write_bytes(tlv::pack(&data, 0x141)?)?;
+        body.write_bytes(tlv::pack(&data, 0x8)?)?;
+        body.write_bytes(tlv::pack(&data, 0x147)?)?;
+        body.write_bytes(tlv::pack(&data, 0x177)?)?;
+        body.write_bytes(tlv::pack(&data, 0x187)?)?;
+        body.write_bytes(tlv::pack(&data, 0x188)?)?;
+        body.write_bytes(tlv::pack(&data, 0x202)?)?;
+        body.write_bytes(tlv::pack(&data, 0x511)?)?;
         let request = data.build_login_request(LoginCommand::WtLoginExchangeEmp, body, None)?;
         drop(data);
 
         self.login(request).await
+    }
+
+    pub async fn password_login(&mut self, md5_password: [u8; 16]) -> Result<(), CommonError> {
+        let mut data = self.data().await;
+        data.sig.session = rand::random::<[u8; 4]>();
+        data.sig.randkey = rand::random::<[u8; 16]>();
+        data.sig.tgtgt = rand::random::<[u8; 16]>();
+        data.ecdh = ECDH::new();
+
+        let mut body = Vec::with_capacity(1000);
+        body.write_u16(9)?;
+        body.write_u16(23)?;
+        body.write_bytes(tlv::pack(&data, 0x18)?)?;
+        body.write_bytes(tlv::pack(&data, 0x1)?)?;
+        body.write_bytes(tlv::pack_with_args(
+            &data,
+            0x106,
+            None,
+            Some(md5_password),
+            None,
+            None,
+        )?)?;
+        body.write_bytes(tlv::pack(&data, 0x116)?)?;
+        body.write_bytes(tlv::pack(&data, 0x100)?)?;
+        body.write_bytes(tlv::pack(&data, 0x107)?)?;
+        body.write_bytes(tlv::pack(&data, 0x142)?)?;
+        body.write_bytes(tlv::pack(&data, 0x144)?)?;
+        body.write_bytes(tlv::pack(&data, 0x145)?)?;
+        body.write_bytes(tlv::pack(&data, 0x147)?)?;
+        body.write_bytes(tlv::pack(&data, 0x154)?)?;
+        body.write_bytes(tlv::pack(&data, 0x141)?)?;
+        body.write_bytes(tlv::pack(&data, 0x8)?)?;
+        body.write_bytes(tlv::pack(&data, 0x511)?)?;
+        body.write_bytes(tlv::pack(&data, 0x187)?)?;
+        body.write_bytes(tlv::pack(&data, 0x188)?)?;
+        body.write_bytes(tlv::pack(&data, 0x194)?)?;
+        body.write_bytes(tlv::pack(&data, 0x191)?)?;
+        body.write_bytes(tlv::pack(&data, 0x202)?)?;
+        body.write_bytes(tlv::pack(&data, 0x177)?)?;
+        body.write_bytes(tlv::pack(&data, 0x516)?)?;
+        body.write_bytes(tlv::pack(&data, 0x521)?)?;
+        body.write_bytes(tlv::pack(&data, 0x525)?)?;
+        let request = data.build_login_request(LoginCommand::WtLoginLogin, body, None)?;
+        drop(data);
+
+        self.login(request).await
+    }
+
+    pub async fn qrcode_login(&mut self) -> Result<(), CommonError> {
+        todo!()
     }
 
     async fn login(&mut self, request: LoginRequest) -> Result<(), CommonError> {
@@ -673,10 +439,10 @@ impl BaseClient {
             let mut body = Vec::with_capacity(500);
             body.write_u16(20)?;
             body.write_u16(4)?;
-            body.write_bytes(tlv::pack_tlv(&data, 0x8)?)?;
-            body.write_bytes(tlv::pack_tlv(&data, 0x104)?)?;
-            body.write_bytes(tlv::pack_tlv(&data, 0x116)?)?;
-            body.write_bytes(tlv::pack_tlv(&data, 0x401)?)?;
+            body.write_bytes(tlv::pack(&data, 0x8)?)?;
+            body.write_bytes(tlv::pack(&data, 0x104)?)?;
+            body.write_bytes(tlv::pack(&data, 0x116)?)?;
+            body.write_bytes(tlv::pack(&data, 0x401)?)?;
 
             let request = data.build_login_request(LoginCommand::WtLoginLogin, body, None)?;
             drop(data);
@@ -778,6 +544,58 @@ impl BaseClient {
             Ok(())
         }
     }
+
+    pub async fn fetch_qrcode(&self) -> Result<(), CommonError> {
+        let mut data = self.data().await;
+        let mut body = Vec::with_capacity(1024);
+        body.write_u16(0)?;
+        body.write_u32(16)?;
+        body.write_u64(0)?;
+        body.write_u8(8)?;
+        body.write_tlv(&BUF_0)?;
+        body.write_u16(6)?;
+        body.write_bytes(tlv::pack(&data, 0x16)?)?;
+        body.write_bytes(tlv::pack(&data, 0x1B)?)?;
+        body.write_bytes(tlv::pack(&data, 0x1D)?)?;
+        body.write_bytes(tlv::pack(&data, 0x1F)?)?;
+        body.write_bytes(tlv::pack(&data, 0x33)?)?;
+        body.write_bytes(tlv::pack(&data, 0x35)?)?;
+
+        let request = data.build_qrcode_request(0x31, 0x11100, body)?;
+        drop(data);
+
+        let response = self
+            .networker
+            .lock()
+            .await
+            .send_request(request, None)
+            .await?;
+        let response_body = response.await?;
+
+        let decrypted = tea::decrypt(
+            &response_body[16..response_body.len() - 1],
+            &self.data().await.ecdh.share_key,
+        )?;
+        let retcode = decrypted[54];
+        let reader = &mut &decrypted[55..];
+        let qrsig_len = reader.read_u16()?;
+        let qrsig = reader.read_bytes(qrsig_len as usize)?;
+        let _ = reader.read_u16()?;
+        let mut t = reader.read_tlv()?;
+
+        if retcode == 0 && t.contains_key(&0x17) {
+            let t17 = t.remove(&0x17).unwrap();
+            self.data().await.sig.qrsig = qrsig;
+            let _ = self.qrcode_tx.send(t17);
+        } else {
+            let _ = self.error_tx.send(InternalErrorKind::Qrcode(
+                retcode,
+                "获取二维码失败，请重试".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 impl BaseClient {}
@@ -802,7 +620,7 @@ pub struct User {
     pub age: u8,
 }
 #[derive(Debug)]
-pub struct Data {
+pub struct DataCenter {
     pub pskey: HashMap<String, Vec<u8>>,
     pub uin: u32,
     pub apk: APK,
@@ -811,7 +629,7 @@ pub struct Data {
     pub ecdh: ECDH,
 }
 
-impl Data {
+impl DataCenter {
     fn new(uin: u32, platform: Platform, d: Option<ShortDevice>) -> Self {
         Self {
             pskey: HashMap::new(),
@@ -824,7 +642,7 @@ impl Data {
     }
 }
 
-impl Data {
+impl DataCenter {
     fn increase_seq(&mut self) -> u32 {
         let mut next = self.sig.seq + 1;
         if next >= 0x8000 {
@@ -844,9 +662,10 @@ impl Data {
     where
         B: AsRef<[u8]>,
     {
+        let typee = typee.unwrap_or(CommandType::Type2);
+
         let seq = self.increase_seq();
 
-        let typee = typee.unwrap_or(CommandType::Type2);
         let (uin, cmd_id, subid) = match command {
             LoginCommand::WtLoginTransEmp => (0, 0x812, Platform::watch().subid),
             _ => (self.uin, 0x810, self.apk.subid),
@@ -860,9 +679,8 @@ impl Data {
                     Vec::with_capacity(24 + self.ecdh.public_key.len() + encrypted.len());
                 buf_0.write_u8(0x02)?;
                 buf_0.write_u8(0x01)?;
-                buf_0.write_all(&self.sig.randkey)?;
+                buf_0.write_bytes(&self.sig.randkey)?;
                 buf_0.write_u16(0x131)?;
-                buf_0.write_u16(0x01)?;
                 buf_0.write_u16(0x01)?;
                 buf_0.write_tlv(&self.ecdh.public_key)?;
                 buf_0.write_bytes(encrypted)?;
@@ -880,7 +698,7 @@ impl Data {
                 buf_1.write_u32(2)?;
                 buf_1.write_u32(0)?;
                 buf_1.write_u32(0)?;
-                buf_1.write_bytes(&body)?;
+                buf_1.write_bytes(&buf_0)?;
                 buf_1.write_u8(0x03)?;
 
                 buf_1.as_slice()
@@ -903,6 +721,7 @@ impl Data {
         buf.write_u32(4)?;
         buf.write_u16(2)?;
         buf.write_u32(4)?;
+
         let mut sso = Vec::with_capacity(buf.len() + body.len() + 8);
         sso.write_bytes_with_length(buf)?;
         sso.write_bytes_with_length(body)?;
@@ -913,17 +732,47 @@ impl Data {
             _ => sso,
         };
 
-        let mut payload = Vec::with_capacity(100);
+        let uin = uin.to_string();
+        let mut payload =
+            Vec::with_capacity(14 + &self.sig.d2.len() + encrypted_sso.len() + uin.len());
         payload.write_u32(0x0A)?;
         payload.write_u8(typee as u8)?;
         payload.write_bytes_with_length(&self.sig.d2)?;
         payload.write_u8(0)?;
-        payload.write_bytes_with_length(uin.to_string())?;
+        payload.write_bytes_with_length(uin)?;
         payload.write_bytes(encrypted_sso)?;
         let mut result = Vec::with_capacity(payload.len() + 4);
         result.write_bytes_with_length(payload)?;
 
         Ok(LoginRequest::new(seq, command, result))
+    }
+
+    fn build_qrcode_request<B: AsRef<[u8]>>(
+        &mut self,
+        cmd_id: u16,
+        head: u32,
+        body: B,
+    ) -> Result<LoginRequest, CommonError> {
+        let body = body.as_ref();
+        let mut buf = Vec::with_capacity(62 + body.len());
+        buf.write_u32(head)?;
+        buf.write_u32(0x1000)?;
+        buf.write_u16(0)?;
+        buf.write_u32(0x72000000)?;
+        buf.write_u32(current_unix_timestamp_as_secs() as u32)?;
+        buf.write_u8(2)?;
+        buf.write_u16((44 + body.len()) as u16)?;
+        buf.write_u16(cmd_id)?;
+        buf.write_bytes([0; 21])?;
+        buf.write_u8(3)?;
+        buf.write_u16(0)?;
+        buf.write_u16(50)?;
+        buf.write_u32(self.sig.seq + 1)?;
+        buf.write_u64(0)?;
+        buf.write_bytes(body)?;
+        buf.write_u8(3)?;
+        let request = self.build_login_request(LoginCommand::WtLoginTransEmp, buf, None)?;
+        Ok(request)
     }
 
     fn build_uni_request<B>(
@@ -1104,10 +953,8 @@ impl Data {
 
 #[derive(Debug)]
 struct Networker {
-    statistics: Arc<Mutex<Statistics>>,
-    data: Arc<Mutex<Data>>,
+    data: Arc<Mutex<DataCenter>>,
     network: Network,
-    polling_requests: HashMap<u32, Weak<Mutex<Option<Vec<u8>>>>>,
     registered: AtomicBool,
 
     error_tx: Sender<InternalErrorKind>,
@@ -1116,21 +963,19 @@ struct Networker {
 impl Networker {
     fn new(
         statistics: Arc<Mutex<Statistics>>,
-        data: Arc<Mutex<Data>>,
+        data: Arc<Mutex<DataCenter>>,
         error_tx: Sender<InternalErrorKind>,
     ) -> Self {
         Self {
-            statistics,
+            network: Network::new(Arc::clone(&data), statistics),
             data,
-            network: Network::new(),
-            polling_requests: HashMap::new(),
             registered: AtomicBool::new(false),
             error_tx,
         }
     }
 
-    fn on_packet(&self) -> Receiver<Vec<u8>> {
-        self.network.on_packet()
+    fn on_sso(&self) -> Receiver<(u32, String, Vec<u8>)> {
+        self.network.on_sso()
     }
 
     fn on_state(&self) -> Receiver<(NetworkState, Option<SocketAddr>)> {
@@ -1150,7 +995,8 @@ impl Networker {
     }
 
     async fn connect(&mut self) -> Result<(), CommonError> {
-        self.network.connect().await
+        self.network.connect().await?;
+        self.sync_time_diff().await
     }
 
     async fn disconnect(&mut self) -> Result<(), CommonError> {
@@ -1159,6 +1005,24 @@ impl Networker {
 }
 
 impl Networker {
+    async fn sync_time_diff(&mut self) -> Result<(), CommonError> {
+        let request_packet = self.data.lock().await.build_login_request(
+            LoginCommand::ClientCorrectTime,
+            BUF_4,
+            Some(CommandType::Type0),
+        )?;
+        let request = self.send_request(request_packet, None).await?;
+        let response_body = request.await?;
+
+        // 此处忽略错误
+        if let Ok(server_time) = (&mut response_body.as_slice()).read_i32() {
+            self.data.lock().await.sig.time_diff =
+                server_time as i64 - current_unix_timestamp_as_secs() as i64;
+        }
+
+        Ok(())
+    }
+
     /// 等待返回结果
     async fn send_request<B>(
         &mut self,
@@ -1168,16 +1032,9 @@ impl Networker {
     where
         B: Request,
     {
-        let response = Response {
-            timeout: timeout.unwrap_or(Duration::from_secs(5)),
-            start: Instant::now(),
-            response: Arc::new(Mutex::new(None)),
-        };
-        self.polling_requests
-            .insert(request.seq(), Arc::downgrade(&response.response));
-        self.write_request(request).await?;
-
-        Ok(response)
+        self.network
+            .send_request(request, timeout.unwrap_or(Duration::from_secs(5)))
+            .await
     }
 
     /// 不等待返回结果
@@ -1185,13 +1042,7 @@ impl Networker {
     where
         B: Request,
     {
-        self.network.send_bytes(request.payload()).await?;
-
-        self.statistics.lock().await.sent_pkt_cnt += 1;
-
-        debug!("send: {} seq: {}", request.command(), request.seq());
-
-        Ok(())
+        self.network.write_request(request).await
     }
 
     async fn register(
@@ -1268,24 +1119,11 @@ impl Networker {
         let response = self.send_request(request, timeout).await?;
         Ok(response)
     }
-
-    async fn response_a_request(&mut self, seq: u32, payload: Vec<u8>) -> bool {
-        if let Some(packet) = self
-            .polling_requests
-            .remove(&seq)
-            .and_then(|packet| packet.upgrade())
-        {
-            *packet.lock().await = Some(payload);
-            true
-        } else {
-            false
-        }
-    }
 }
 
 #[derive(Debug)]
 struct Registry {
-    data: Arc<Mutex<Data>>,
+    data: Arc<Mutex<DataCenter>>,
     networker: Arc<Mutex<Networker>>,
     heartbeat_handler: Option<JoinHandle<()>>,
 
@@ -1294,7 +1132,7 @@ struct Registry {
 
 impl Registry {
     fn new(
-        data: Arc<Mutex<Data>>,
+        data: Arc<Mutex<DataCenter>>,
         networker: Arc<Mutex<Networker>>,
         token_tx: Sender<Vec<u8>>,
     ) -> Self {
@@ -1349,14 +1187,14 @@ impl Registry {
 #[derive(Debug)]
 struct Heartbeater {
     retried: u8,
-    data: Arc<Mutex<Data>>,
+    data: Arc<Mutex<DataCenter>>,
     networker: Arc<Mutex<Networker>>,
     token_tx: Sender<Vec<u8>>,
 }
 
 impl Heartbeater {
     fn new(
-        data: Arc<Mutex<Data>>,
+        data: Arc<Mutex<DataCenter>>,
         networker: Arc<Mutex<Networker>>,
         token_tx: Sender<Vec<u8>>,
     ) -> Self {
@@ -1383,29 +1221,6 @@ impl Heartbeater {
         })
     }
 
-    async fn sync_time_diff(&mut self) -> Result<(), CommonError> {
-        let request_packet = self.data.lock().await.build_login_request(
-            LoginCommand::ClientCorrectTime,
-            BUF_4,
-            Some(CommandType::Type0),
-        )?;
-        let request = self
-            .networker
-            .lock()
-            .await
-            .send_request(request_packet, None)
-            .await?;
-        let response = request.await?;
-
-        // 此处忽略错误
-        if let Ok(server_time) = (&mut response.as_slice()).read_i32() {
-            self.data.lock().await.sig.time_diff =
-                server_time as i64 - current_unix_timestamp_as_secs() as i64;
-        }
-
-        Ok(())
-    }
-
     async fn refresh_token(&mut self) -> Result<(), CommonError> {
         let mut data = self.data.lock().await;
 
@@ -1416,22 +1231,22 @@ impl Heartbeater {
         let mut body = Vec::with_capacity(2000);
         body.write_u16(11)?;
         body.write_u16(16)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x100)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x10a)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x116)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x144)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x143)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x142)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x154)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x18)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x141)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x8)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x147)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x177)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x187)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x188)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x202)?)?;
-        body.write_bytes(tlv::pack_tlv(&data, 0x511)?)?;
+        body.write_bytes(tlv::pack(&data, 0x100)?)?;
+        body.write_bytes(tlv::pack(&data, 0x10a)?)?;
+        body.write_bytes(tlv::pack(&data, 0x116)?)?;
+        body.write_bytes(tlv::pack(&data, 0x144)?)?;
+        body.write_bytes(tlv::pack(&data, 0x143)?)?;
+        body.write_bytes(tlv::pack(&data, 0x142)?)?;
+        body.write_bytes(tlv::pack(&data, 0x154)?)?;
+        body.write_bytes(tlv::pack(&data, 0x18)?)?;
+        body.write_bytes(tlv::pack(&data, 0x141)?)?;
+        body.write_bytes(tlv::pack(&data, 0x8)?)?;
+        body.write_bytes(tlv::pack(&data, 0x147)?)?;
+        body.write_bytes(tlv::pack(&data, 0x177)?)?;
+        body.write_bytes(tlv::pack(&data, 0x187)?)?;
+        body.write_bytes(tlv::pack(&data, 0x188)?)?;
+        body.write_bytes(tlv::pack(&data, 0x202)?)?;
+        body.write_bytes(tlv::pack(&data, 0x511)?)?;
         let packet = data.build_login_request(LoginCommand::WtLoginExchangeEmp, body, None)?;
         drop(data);
 
@@ -1465,7 +1280,7 @@ impl Heartbeater {
 
     #[async_recursion]
     async fn beat(&mut self) -> Result<(), CommonError> {
-        self.sync_time_diff().await?;
+        self.networker.lock().await.sync_time_diff().await?;
 
         let request_packet = self.data.lock().await.build_uni_request(
             UniCommand::OidbSvc,
@@ -1500,11 +1315,63 @@ impl Heartbeater {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        fs::{self, OpenOptions},
+        io::Read,
+        time::Duration,
+    };
 
-    use crate::{core::error::CommonError, init_logger};
+    use crate::{
+        core::{error::CommonError, io::WriteExt, network::LoginRequest},
+        init_logger,
+    };
 
     use super::BaseClient;
+
+    #[tokio::test]
+    async fn test_fetch_qrcode() -> Result<(), CommonError> {
+        init_logger();
+
+        let base_client = BaseClient::default(640279992).await;
+
+        let mut qrcode_rx = base_client.qrcode_tx.subscribe();
+        let handler_0 = tokio::spawn(async move {
+            if let Ok(qrcode) = qrcode_rx.recv().await {
+                let mut file = fs::OpenOptions::new()
+                    .append(false)
+                    .create(true)
+                    .write(true)
+                    .open("./1.jpeg")
+                    .unwrap();
+                let _ = file.write_bytes(&qrcode);
+            }
+        });
+
+        let mut error_rx = base_client.on_error();
+        let handler_1 = tokio::spawn(async move {
+            while let Ok(err) = error_rx.recv().await {
+                match err {
+                    super::InternalErrorKind::Token => println!("token"),
+                    super::InternalErrorKind::UnknownLoginType(typee, reason) => {
+                        println!("type: {} error, {}", typee, reason)
+                    }
+                    super::InternalErrorKind::Qrcode(retcode, reason) => {
+                        println!("retcode: {} {}", retcode, reason)
+                    }
+                }
+            }
+            println!("111");
+        });
+
+        base_client.connect().await?;
+        base_client.fetch_qrcode().await?;
+        let _ = handler_0.await;
+        base_client.disconnect().await?;
+        drop(base_client);
+        let _ = handler_1.await;
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test() -> Result<(), CommonError> {
@@ -1512,9 +1379,9 @@ mod tests {
 
         let base_client = BaseClient::default(1313).await;
 
-        base_client.networker.lock().await.connect().await?;
+        base_client.connect().await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
-        base_client.networker.lock().await.disconnect().await?;
+        base_client.disconnect().await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
         drop(base_client);
 

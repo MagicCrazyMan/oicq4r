@@ -179,7 +179,7 @@ impl ShortDevice {
             u16::from_be_bytes(hash[4..6].try_into().unwrap())
         );
         let mac_address = format!(
-            "00:50:{:X}:{:X}:{:X}:{:X}",
+            "00:50:{:2X}:{:2X}:{:2X}:{:2X}",
             hash[6], hash[7], hash[8], hash[9]
         );
         let ip_address = format!("10.0.{}.{}", hash[10], hash[11]);
@@ -241,11 +241,10 @@ impl ShortDevice {
                 if i % 2 == 0 {
                     sum += char.to_digit(10).unwrap();
                 } else {
-                    let j = char.to_digit(10).unwrap();
+                    let j = char.to_digit(10).unwrap() * 2;
                     sum += j % 10 + (j as f32 / 10.0).floor() as u32;
                 }
             }
-
             (100 - sum) % 10
         };
 
@@ -299,7 +298,11 @@ impl From<ShortDevice> for FullDevice {
         };
 
         let imsi = rand::random::<[u8; 16]>();
-        let guid = md5::compute(format!("{}{}", &d.imei, &d.mac_address).as_bytes()).0;
+        let mut raw_guid: Vec<u8> =
+            Vec::with_capacity(d.imei.as_bytes().len() + d.mac_address.as_bytes().len());
+        raw_guid.extend(d.imei.as_bytes());
+        raw_guid.extend(d.mac_address.as_bytes());
+        let guid = md5::compute(raw_guid).0;
         Self {
             display: d.android_id.clone(),
             product: d.product,
