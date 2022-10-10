@@ -1,6 +1,7 @@
 pub mod core;
 pub mod event;
 
+#[cfg(test)]
 fn init_logger() {
     #[cfg(test)]
     let _ = env_logger::builder()

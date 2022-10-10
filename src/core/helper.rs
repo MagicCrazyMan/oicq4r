@@ -12,3 +12,11 @@ pub fn current_unix_timestamp_as_secs() -> u64 {
         .unwrap()
         .as_secs()
 }
+
+
+pub fn current_unix_timestamp_as_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+}

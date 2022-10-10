@@ -1,22 +1,17 @@
 use std::{
     collections::HashMap,
     fmt::Display,
-    fs::File,
-    future::Future,
-    io::{Cursor, Read, Seek, SeekFrom, Write},
+    io::{Cursor, Seek, SeekFrom},
     net::SocketAddr,
-    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Weak,
+        Arc,
     },
-    task::{Context, Poll},
     time::{Duration, SystemTime},
 };
 
 use async_recursion::async_recursion;
-use flate2::Decompress;
-use log::{debug, error, info, Level};
+use log::{error, info, Level};
 use tokio::{
     sync::{
         self,
@@ -24,7 +19,6 @@ use tokio::{
         Mutex, MutexGuard,
     },
     task::JoinHandle,
-    time::Instant,
 };
 
 use crate::{core::network::LoginCommand, define_observer};
@@ -38,18 +32,9 @@ use super::{
     jce::{self, JceElement, JceObject},
     network::{LoginRequest, Network, NetworkState, Request, Response, UniCommand, UniRequest},
     protobuf::{self, ProtobufElement, ProtobufObject},
-    tea::{self, decrypt},
+    tea,
     tlv::{self, ReadTlvExt, WriteTlvExt},
 };
-
-#[derive(Debug, Clone, Copy)]
-pub enum QrcodeResult {
-    OtherError = 0x00,
-    Timeout = 0x11,
-    WaitingForScan = 0x30,
-    WaitingForConfirm = 0x35,
-    Canceled = 0x36,
-}
 
 #[derive(Debug, Clone, Copy)]
 pub struct BigData {
@@ -82,7 +67,7 @@ pub struct SIG {
     pub d2key: [u8; 16],
     pub t104: Vec<u8>,
     pub t174: Vec<u8>,
-    pub qrsig: Vec<u8>,
+    pub qrsig: Option<Vec<u8>>,
     pub bigdata: BigData,
     pub hb480: Vec<u8>,
     pub emp_time: u64,
@@ -109,7 +94,7 @@ impl SIG {
             d2key: [0; 16],
             t104: vec![],
             t174: vec![],
-            qrsig: vec![],
+            qrsig: None,
             bigdata: BigData::new(),
             hb480,
             emp_time: 0,
@@ -177,7 +162,6 @@ define_observer! {
     (internal_error_token, ErrorTokenListener, ()),
     (internal_error_network, ErrorNetworkListener, (code: i64, error: &InternalErrorKind)),
     (internal_error_login, ErrorLoginListener, (code: i64, message: &str)),
-    (internal_error_qrcode, ErrorQrcodeListener, (code: &QrcodeResult, message: &str)),
     (internal_online, OnlineListener, (token: &[u8], nickname: &str, gender: u8, age: u8)),
     (internal_token, TokenListener, (token: &[u8])),
     (internal_kickoff, KickoffListener, (reason: &str)),
@@ -405,7 +389,70 @@ impl BaseClient {
     }
 
     pub async fn qrcode_login(&mut self) -> Result<(), CommonError> {
-        todo!()
+        if let Some((retcode, uin, t106, t16a, t318, tgtgt)) = self.verify_qrcode().await? {
+            let mut data = self.data().await;
+            data.sig.qrsig = None;
+
+            if retcode == 0 {
+                if uin != data.uin {
+                    let _ = self.error_tx.send(InternalErrorKind::Qrcode(
+                        retcode,
+                        format!("扫码账号({})与登录账号({})不符", uin, data.uin),
+                    ));
+                    return Ok(());
+                }
+
+                data.sig.tgtgt = tgtgt;
+
+                let mut body = Vec::with_capacity(4096);
+                body.write_u16(9)?;
+                body.write_u16(24)?;
+                body.write_bytes(tlv::pack(&data, 0x18)?)?;
+                body.write_bytes(tlv::pack(&data, 0x1)?)?;
+                body.write_u16(0x106)?;
+                body.write_tlv(t106)?;
+                body.write_bytes(tlv::pack(&data, 0x116)?)?;
+                body.write_bytes(tlv::pack(&data, 0x100)?)?;
+                body.write_bytes(tlv::pack(&data, 0x107)?)?;
+                body.write_bytes(tlv::pack(&data, 0x142)?)?;
+                body.write_bytes(tlv::pack(&data, 0x144)?)?;
+                body.write_bytes(tlv::pack(&data, 0x145)?)?;
+                body.write_bytes(tlv::pack(&data, 0x147)?)?;
+                body.write_u16(0x16a)?;
+                body.write_tlv(t16a)?;
+                body.write_bytes(tlv::pack(&data, 0x154)?)?;
+                body.write_bytes(tlv::pack(&data, 0x141)?)?;
+                body.write_bytes(tlv::pack(&data, 0x8)?)?;
+                body.write_bytes(tlv::pack(&data, 0x511)?)?;
+                body.write_bytes(tlv::pack(&data, 0x187)?)?;
+                body.write_bytes(tlv::pack(&data, 0x188)?)?;
+                body.write_bytes(tlv::pack(&data, 0x194)?)?;
+                body.write_bytes(tlv::pack(&data, 0x191)?)?;
+                body.write_bytes(tlv::pack(&data, 0x202)?)?;
+                body.write_bytes(tlv::pack(&data, 0x177)?)?;
+                body.write_bytes(tlv::pack(&data, 0x516)?)?;
+                body.write_bytes(tlv::pack(&data, 0x521)?)?;
+                body.write_u16(0x318)?;
+                body.write_tlv(t318)?;
+                let request = data.build_login_request(LoginCommand::WtLoginLogin, body, None)?;
+                drop(data);
+
+                self.login(request).await?;
+            } else {
+                let msg = match retcode {
+                    0x11 => "二维码超时，请重新获取",
+                    0x30 => "二维码尚未扫描",
+                    0x35 => "二维码尚未确认",
+                    0x36 => "二维码被取消，请重新获取",
+                    _ => "服务器错误，请重新获取",
+                };
+                let _ = self
+                    .error_tx
+                    .send(InternalErrorKind::Qrcode(retcode, msg.to_string()));
+            }
+        }
+
+        Ok(())
     }
 
     async fn login(&mut self, request: LoginRequest) -> Result<(), CommonError> {
@@ -413,7 +460,7 @@ impl BaseClient {
             .networker
             .lock()
             .await
-            .send_registered_request(request, None)
+            .send_request(request, None)
             .await?
             .await?;
 
@@ -425,9 +472,13 @@ impl BaseClient {
     #[async_recursion]
     async fn decode_login_response(&mut self, payload: Vec<u8>) -> Result<(), CommonError> {
         let mut data = self.data().await;
-        let decrypted = tea::decrypt(&mut &payload[16..], &data.ecdh.share_key)?;
-        let typee = decrypted[2];
-        let mut t = (&mut &decrypted[5..]).read_tlv()?;
+        let decrypted = tea::decrypt(&mut &payload[16..payload.len() - 1], &data.ecdh.share_key)?;
+
+        let mut cursor = Cursor::new(decrypted);
+        cursor.seek(SeekFrom::Current(2))?;
+        let typee = cursor.read_u8()?;
+        cursor.seek(SeekFrom::Current(2))?;
+        let mut t = cursor.read_tlv()?;
 
         if typee == 204 {
             info!("unlocking...");
@@ -576,16 +627,18 @@ impl BaseClient {
             &response_body[16..response_body.len() - 1],
             &self.data().await.ecdh.share_key,
         )?;
-        let retcode = decrypted[54];
-        let reader = &mut &decrypted[55..];
-        let qrsig_len = reader.read_u16()?;
-        let qrsig = reader.read_bytes(qrsig_len as usize)?;
-        let _ = reader.read_u16()?;
-        let mut t = reader.read_tlv()?;
+
+        let mut cursor = Cursor::new(decrypted);
+        cursor.seek(SeekFrom::Current(54))?;
+        let retcode = cursor.read_u8()?;
+        let qrsig_len = cursor.read_u16()?;
+        let qrsig = cursor.read_bytes(qrsig_len as usize)?;
+        cursor.seek(SeekFrom::Current(2))?;
+        let mut t = cursor.read_tlv()?;
 
         if retcode == 0 && t.contains_key(&0x17) {
             let t17 = t.remove(&0x17).unwrap();
-            self.data().await.sig.qrsig = qrsig;
+            self.data().await.sig.qrsig = Some(qrsig);
             let _ = self.qrcode_tx.send(t17);
         } else {
             let _ = self.error_tx.send(InternalErrorKind::Qrcode(
@@ -595,6 +648,83 @@ impl BaseClient {
         }
 
         Ok(())
+    }
+
+    pub async fn verify_qrcode(
+        &self,
+    ) -> Result<Option<(u8, u32, Vec<u8>, Vec<u8>, Vec<u8>, [u8; 16])>, CommonError> {
+        let mut data = self.data().await;
+        if let Some(qrsig) = &data.sig.qrsig {
+            let mut body = Vec::with_capacity(26 + qrsig.len());
+            body.write_u16(5)?;
+            body.write_u8(1)?;
+            body.write_u32(8)?;
+            body.write_u32(16)?;
+            body.write_tlv(qrsig)?;
+            body.write_u64(0)?;
+            body.write_u8(8)?;
+            body.write_tlv(BUF_0)?;
+            body.write_u16(0)?;
+
+            let request = data.build_qrcode_request(0x12, 0x6200, body)?;
+            drop(data);
+
+            let response = self
+                .networker
+                .lock()
+                .await
+                .send_request(request, None)
+                .await?;
+            let response_body = response.await?;
+
+            let decrypted = tea::decrypt(
+                &response_body[16..response_body.len() - 1],
+                &self.data().await.ecdh.share_key,
+            )?;
+            let mut cursor = Cursor::new(decrypted);
+            cursor.seek(SeekFrom::Current(48))?;
+            let mut len = cursor.read_u16()?;
+            if len > 0 {
+                len -= 1;
+                if cursor.read_u8()? == 2 {
+                    cursor.seek(SeekFrom::Current(8))?;
+                    len -= 8;
+                }
+
+                if len > 0 {
+                    cursor.seek(SeekFrom::Current(len as i64))?;
+                }
+            }
+
+            cursor.seek(SeekFrom::Current(4))?;
+            let retcode = cursor.read_u8()?;
+            if retcode == 0 {
+                cursor.seek(SeekFrom::Current(4))?;
+                let uin = cursor.read_u32()?;
+                cursor.seek(SeekFrom::Current(6))?;
+
+                let mut t = cursor.read_tlv()?;
+                if let (Some(t106), Some(t16a), Some(t318), Some(tgtgt)) = (
+                    t.remove(&0x18),
+                    t.remove(&0x19),
+                    t.remove(&0x65),
+                    t.remove(&0x1e),
+                ) {
+                    return Ok(Some((
+                        retcode,
+                        uin,
+                        t106,
+                        t16a,
+                        t318,
+                        tgtgt.try_into().unwrap(),
+                    )));
+                }
+            }
+
+            Ok(None)
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -1256,9 +1386,12 @@ impl Heartbeater {
             .await
             .send_request(packet, None)
             .await?;
-        let response = request.await?;
+        let response_body = request.await?;
 
-        let decrypted = tea::decrypt(&response[16..], &self.data.lock().await.ecdh.share_key)?;
+        let decrypted = tea::decrypt(
+            &response_body[16..response_body.len() - 1],
+            &self.data.lock().await.ecdh.share_key,
+        )?;
         let typee = decrypted[2];
         let mut t = (&mut &decrypted[5..]).read_tlv()?;
         if typee == 0 {
@@ -1315,14 +1448,10 @@ impl Heartbeater {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs::{self, OpenOptions},
-        io::Read,
-        time::Duration,
-    };
+    use std::{fs, time::Duration};
 
     use crate::{
-        core::{error::CommonError, io::WriteExt, network::LoginRequest},
+        core::{error::CommonError, io::WriteExt},
         init_logger,
     };
 
@@ -1332,7 +1461,7 @@ mod tests {
     async fn test_fetch_qrcode() -> Result<(), CommonError> {
         init_logger();
 
-        let base_client = BaseClient::default(640279992).await;
+        let mut base_client = BaseClient::default(640279992).await;
 
         let mut qrcode_rx = base_client.qrcode_tx.subscribe();
         let handler_0 = tokio::spawn(async move {
@@ -1360,12 +1489,17 @@ mod tests {
                     }
                 }
             }
-            println!("111");
         });
 
         base_client.connect().await?;
         base_client.fetch_qrcode().await?;
         let _ = handler_0.await;
+
+        let mut online_rx = base_client.online_tx.subscribe();
+        while let Err(_) = online_rx.try_recv() {
+            base_client.qrcode_login().await?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
         base_client.disconnect().await?;
         drop(base_client);
         let _ = handler_1.await;

@@ -551,7 +551,7 @@ fn decode_packet(
     let sso = parse_sso(decrypted.as_slice())?;
     debug!(
         "recv: {}, seq: {}, raw_len: {}, decoded_len: {}",
-        sso.1,
+        sso.1.as_str(),
         sso.0,
         packet.len(),
         sso.2.len()

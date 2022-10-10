@@ -1,24 +1,28 @@
 use std::{
     collections::HashMap,
     io::{Read, Write},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use super::{
     base_client::DataCenter,
     device::Platform,
     error::CommonError,
-    helper::{BUF_0, BUF_1},
+    helper::{current_unix_timestamp_as_millis, BUF_0, BUF_1, BUF_4},
     io::WriteExt,
     protobuf::{encode, ProtobufElement, ProtobufObject},
     tea::{self, encrypt},
 };
 
-fn current_timestamp() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
+trait PartialSlice {
+    fn partial_slice(&self, max: usize) -> &str;
+}
+
+impl<T: AsRef<str>> PartialSlice for T {
+    fn partial_slice(&self, max: usize) -> &str {
+        let str = self.as_ref();
+        let len = if str.len() > max { max } else { str.len() };
+        &str[..len]
+    }
 }
 
 fn pack_body<W: Write>(
@@ -35,8 +39,8 @@ fn pack_body<W: Write>(
             writer.write_u16(1)?;
             writer.write_bytes(&rand::random::<[u8; 4]>())?;
             writer.write_u32(data.uin)?;
-            writer.write_bytes(&current_timestamp().to_be_bytes()[..32])?;
-            writer.write_bytes(&[0; 4])?;
+            writer.write_u32(current_unix_timestamp_as_millis() as u32)?;
+            writer.write_bytes(BUF_4)?;
             writer.write_u16(0)?;
             Ok(())
         }
@@ -109,8 +113,8 @@ fn pack_body<W: Write>(
             writer.write_u32(7)?;
             writer.write_u32(data.apk.appid)?;
             writer.write_u32(if emp.is_some() { 2 } else { data.apk.subid })?;
-            writer.write_u32(8)?;
-            writer.write_u32(8)?;
+            writer.write_u32(0)?;
+            writer.write_u32(data.apk.sigmap)?;
             Ok(())
         }
         0x104 => {
@@ -126,7 +130,7 @@ fn pack_body<W: Write>(
             body.write_u32(data.apk.appid)?;
             body.write_u32(0)?;
             body.write_u64(data.uin as u64)?;
-            body.write_bytes(&current_timestamp().to_be_bytes()[..32])?;
+            body.write_u32(current_unix_timestamp_as_millis() as u32)?;
             body.write_bytes([0; 4])?;
             body.write_u8(1)?;
             body.write_bytes(&md5_password)?;
@@ -174,12 +178,12 @@ fn pack_body<W: Write>(
             Ok(())
         }
         0x124 => {
-            writer.write_tlv(&data.device.os_type[..16])?;
-            writer.write_tlv(&data.device.version.release[..16])?;
+            writer.write_tlv(&data.device.os_type.partial_slice(16))?;
+            writer.write_tlv(&data.device.version.release.partial_slice(16))?;
             writer.write_u16(2)?;
-            writer.write_tlv(&data.device.sim[..16])?;
+            writer.write_tlv(&data.device.sim.partial_slice(16))?;
             writer.write_u16(0)?;
-            writer.write_tlv(&data.device.apn[..16])?;
+            writer.write_tlv(&data.device.apn.partial_slice(16))?;
             Ok(())
         }
         0x128 => {
@@ -188,9 +192,9 @@ fn pack_body<W: Write>(
             writer.write_u8(1)?;
             writer.write_u8(0)?;
             writer.write_u32(16777216)?;
-            writer.write_tlv(&data.device.model[..32])?;
-            writer.write_tlv(&data.device.guid[..16])?;
-            writer.write_tlv(&data.device.brand[..16])?;
+            writer.write_tlv(&data.device.model.partial_slice(32))?;
+            writer.write_tlv(&data.device.guid)?;
+            writer.write_tlv(&data.device.brand.partial_slice(16))?;
             Ok(())
         }
         0x141 => {
@@ -202,7 +206,7 @@ fn pack_body<W: Write>(
         }
         0x142 => {
             writer.write_u16(0)?;
-            writer.write_tlv(&data.apk.id[..32])?;
+            writer.write_tlv(&data.apk.id.partial_slice(32))?;
             Ok(())
         }
         0x143 => {
@@ -227,7 +231,7 @@ fn pack_body<W: Write>(
         }
         0x147 => {
             writer.write_u32(data.apk.appid)?;
-            writer.write_tlv(&data.apk.ver[..5])?;
+            writer.write_tlv(&data.apk.ver.partial_slice(5))?;
             writer.write_tlv(data.apk.sign)?;
             Ok(())
         }
@@ -286,8 +290,8 @@ fn pack_body<W: Write>(
             Ok(())
         }
         0x202 => {
-            writer.write_tlv(&data.device.wifi_bssid[..16])?;
-            writer.write_tlv(&data.device.wifi_ssid[..32])?;
+            writer.write_tlv(&data.device.wifi_bssid.partial_slice(16))?;
+            writer.write_tlv(&data.device.wifi_ssid.partial_slice(32))?;
             Ok(())
         }
         0x400 => {
@@ -297,7 +301,7 @@ fn pack_body<W: Write>(
             writer.write_bytes(rand::random::<[u8; 16]>())?;
             writer.write_i32(1)?;
             writer.write_i32(16)?;
-            writer.write_bytes(&current_timestamp().to_be_bytes()[..32])?;
+            writer.write_u32(current_unix_timestamp_as_millis() as u32)?;
             writer.write_bytes(BUF_0)?;
             Ok(())
         }
@@ -307,6 +311,8 @@ fn pack_body<W: Write>(
         }
         0x511 => {
             let domains = [
+                "aq.qq.com",
+                "buluo.qq.com",
                 "connect.qq.com",
                 "docs.qq.com",
                 "game.qq.com",

@@ -31,7 +31,7 @@ impl CommonError {
     }
 
     pub fn tag_not_existed(tag: u16) -> Self {
-        CommonError::new(format!("tag {:x} not existed", tag))
+        CommonError::new(format!("tag 0x{:x} not existed", tag))
     }
 }
 
