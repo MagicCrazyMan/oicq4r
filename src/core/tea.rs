@@ -1,6 +1,29 @@
-use std::io::{Read, Write};
+use std::{
+    fmt::Display,
+    io::{Read, Write},
+};
 
-use super::{helper::BUF_7, error::CommonError};
+use super::{error::Error, helper::BUF_7};
+
+#[derive(Debug)]
+pub enum TeaError {
+    InvalidData,
+    InvalidLength(usize),
+}
+
+impl std::error::Error for TeaError {}
+
+impl Display for TeaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TeaError::InvalidData => f.write_str("invalidate encrypted data."),
+            TeaError::InvalidLength(len) => f.write_fmt(format_args!(
+                "length of encrypted data must be a multiple of 8, len: {}.",
+                len
+            )),
+        }
+    }
+}
 
 static DELTAS: [u32; 16] = [
     0x9e3779b9, 0x3c6ef372, 0xdaa66d2b, 0x78dde6e4, 0x1715609d, 0xb54cda56, 0x5384540f, 0xf1bbcdc8,
@@ -28,7 +51,7 @@ fn encrypt_part(mut x: u32, mut y: u32, k0: u32, k1: u32, k2: u32, k3: u32) -> (
     (x, y)
 }
 
-pub fn encrypt<B>(data: B, key: &[u8; 16]) -> Result<Vec<u8>, CommonError>
+pub fn encrypt<B>(data: B, key: &[u8; 16]) -> Result<Vec<u8>, Error>
 where
     B: AsRef<[u8]>,
 {
@@ -97,15 +120,13 @@ fn decrypt_part(mut x: u32, mut y: u32, k0: u32, k1: u32, k2: u32, k3: u32) -> (
     (x as u32, y as u32)
 }
 
-pub fn decrypt<B>(encrypted: B, key: &[u8; 16]) -> Result<Vec<u8>, CommonError>
+pub fn decrypt<B>(encrypted: B, key: &[u8; 16]) -> Result<Vec<u8>, Error>
 where
     B: AsRef<[u8]>,
 {
     let encrypted = encrypted.as_ref();
     if encrypted.len() % 8 != 0 {
-        return Err(CommonError::from(
-            "length of encrypted data must be a multiple of 8",
-        ));
+        return Err(Error::from(TeaError::InvalidLength(encrypted.len())));
     }
 
     let mut decrypted = Vec::<u8>::with_capacity(encrypted.len());
@@ -144,11 +165,9 @@ where
         decrypted.write_all(&r2.to_be_bytes())?;
     }
 
-    if let std::cmp::Ordering::Equal =
-        BUF_7.cmp(&decrypted[decrypted.len() - 7..].try_into()?)
-    {
+    if let std::cmp::Ordering::Equal = BUF_7.cmp(&decrypted[decrypted.len() - 7..].try_into()?) {
         Ok((&decrypted[((decrypted[0] & 0x07) + 3) as usize..decrypted.len() - 7]).to_vec())
     } else {
-        Err(CommonError::from("encrypted data is illegal"))
+        return Err(Error::from(TeaError::InvalidData));
     }
 }

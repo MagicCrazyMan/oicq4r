@@ -26,15 +26,53 @@ use crate::core::network::LoginCommand;
 use super::{
     device::{FullDevice, Platform, ShortDevice, APK},
     ecdh::ECDH,
-    error::CommonError,
+    error::Error,
     helper::{current_unix_timestamp_as_secs, BUF_0, BUF_16, BUF_4},
     io::{ReadExt, WriteExt},
-    jce::{self, JceElement, JceObject},
-    network::{LoginRequest, Network, NetworkState, Request, Response, UniCommand, UniRequest},
+    jce::{self, JceElement, JceError, JceObject},
+    network::{LoginRequest, Network, NetworkState, Request, Response, UniCommand, UniRequest, SSO},
     protobuf::{self, ProtobufElement, ProtobufObject},
     tea,
-    tlv::{self, ReadTlvExt, WriteTlvExt},
+    tlv::{self, ReadTlvExt, TlvError, WriteTlvExt},
 };
+
+#[derive(Debug)]
+pub enum LoginResult {
+    Succeeded(User),
+    Failure(String, String),
+    SliderAuthorizationRequired(String),
+    SecurityAuthorizationRequired(Option<String>, Option<String>),
+    PhoneSecurityCodeSent,
+    BadToken,
+    QrcodeUinNotMatched(u32, u32),
+    QrcodeTimeout,
+    QrcodeNotScanned,
+    QrcodeNotConfirmed,
+    QrcodeCancelled,
+    QrcodeServerError,
+    UnknownLoginType(u8),
+}
+
+#[derive(Debug)]
+pub enum ClientError {
+    FetchQrcodeFailure,
+    NotRegistered,
+    HeartbeatFailure,
+}
+
+impl std::error::Error for ClientError {}
+
+impl Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self {
+            ClientError::FetchQrcodeFailure => f.write_str("fetch qrcode failure."),
+            ClientError::NotRegistered => {
+                f.write_str("tried to send registered request before registered.")
+            }
+            ClientError::HeartbeatFailure => f.write_str("heartbeat failure."),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct BigData {
@@ -160,52 +198,28 @@ pub struct BaseClient {
     data: Arc<Mutex<DataCenter>>,
     networker: Arc<Mutex<Networker>>,
     register: Arc<Mutex<Registry>>,
-
-    error_tx: Sender<InternalErrorKind>,
-    token_tx: Sender<Vec<u8>>,
-    online_tx: Sender<User>,
-    slider_tx: Sender<String>,
-    qrcode_tx: Sender<Vec<u8>>,
-    verify_tx: Sender<(Option<String>, Option<String>)>,
 }
 
 impl BaseClient {
     pub async fn new(uin: u32, platform: Platform, d: Option<ShortDevice>) -> Self {
-        let error_tx = sync::broadcast::channel(1).0;
-        let token_tx = sync::broadcast::channel(1).0;
-        let online_tx = sync::broadcast::channel(1).0;
-        let slider_tx = sync::broadcast::channel(1).0;
-        let qrcode_tx = sync::broadcast::channel(1).0;
-        let verify_tx = sync::broadcast::channel(1).0;
-
         let data = Arc::new(Mutex::new(DataCenter::new(uin, platform, d)));
         let statistics = Arc::new(Mutex::new(Statistics::new()));
         let networker = Arc::new(Mutex::new(Networker::new(
             Arc::clone(&statistics),
             Arc::clone(&data),
-            error_tx.clone(),
         )));
         let register = Arc::new(Mutex::new(Registry::new(
             Arc::clone(&data),
             Arc::clone(&networker),
-            token_tx.clone(),
         )));
         let mut instance = Self {
             data,
             networker,
             statistics,
             register,
-
-            error_tx,
-            token_tx,
-            online_tx,
-            slider_tx,
-            qrcode_tx,
-            verify_tx,
         };
 
         instance.describe_network_state().await;
-        instance.describe_network_error().await;
 
         instance
     }
@@ -214,11 +228,11 @@ impl BaseClient {
         Self::new(uin, Platform::Android, None).await
     }
 
-    pub async fn connect(&self) -> Result<(), CommonError> {
+    pub async fn connect(&self) -> Result<(), Error> {
         self.networker.lock().await.connect().await
     }
 
-    pub async fn disconnect(&self) -> Result<(), CommonError> {
+    pub async fn disconnect(&self) -> Result<(), Error> {
         self.networker.lock().await.disconnect().await
     }
 
@@ -226,71 +240,49 @@ impl BaseClient {
         self.data.lock().await
     }
 
-    pub fn on_error(&self) -> Receiver<InternalErrorKind> {
-        self.error_tx.subscribe()
+    pub async fn statistics(&self) -> MutexGuard<Statistics> {
+        self.statistics.lock().await
     }
 
-    pub async fn on_sso(&self) -> Receiver<(u32, String, Vec<u8>)> {
+    pub async fn on_sso(&self) -> Receiver<SSO> {
         self.networker.lock().await.on_sso()
+    }
+
+    pub async fn on_token_update(&self) -> Receiver<Vec<u8>> {
+        self.register.lock().await.on_token_update()
     }
 }
 
 impl BaseClient {
     async fn describe_network_state(&mut self) {
-        let statistics = Arc::clone(&self.statistics);
         let networker = Arc::clone(&self.networker);
         let register = Arc::clone(&self.register);
 
         let mut rx = self.networker.lock().await.on_state();
         tokio::spawn(async move {
-            while let Ok((state, socket_addr)) = rx.recv().await {
-                let socket_addr_str = socket_addr
-                    .and_then(|socket_addr| Some(socket_addr.to_string()))
-                    .unwrap_or("unknown remote server".to_string());
+            while let Ok((state, _)) = rx.recv().await {
+                if let NetworkState::Lost(_) = state {
+                    networker.lock().await.set_registered(false);
 
-                let _ = match state {
-                    NetworkState::Closed => {
-                        info!("{} closed", socket_addr_str);
-
-                        statistics.lock().await.remote_socket_addr = None;
-                    }
-                    NetworkState::Lost => {
-                        error!("{} lost", socket_addr_str);
-
-                        statistics.lock().await.lost_times += 1;
-                        networker.lock().await.set_registered(false);
-
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        let _ = register.lock().await.register().await;
-                    }
-                    NetworkState::Connecting => {
-                        info!("connecting...")
-                    }
-                    NetworkState::Connected => {
-                        info!("{} connected", socket_addr_str);
-
-                        statistics.lock().await.remote_socket_addr = socket_addr.clone();
+                    loop {
+                        if let Err(_) = networker.lock().await.connect().await {
+                            continue;
+                        }
+                        if let Ok(_) = register.lock().await.register().await {
+                            break;
+                        }
                     }
                 };
-            }
-        });
-    }
-
-    async fn describe_network_error(&mut self) {
-        let mut rx = self.networker.lock().await.on_error();
-        tokio::spawn(async move {
-            while let Ok(err) = rx.recv().await {
-                error!("{}", err);
             }
         });
     }
 }
 
 impl BaseClient {
-    pub async fn token_login<B: AsRef<[u8]>>(&mut self, token: B) -> Result<(), CommonError> {
+    pub async fn token_login<B: AsRef<[u8]>>(&mut self, token: B) -> Result<LoginResult, Error> {
         let token = token.as_ref();
         if token.len() != 144 || token.len() != 152 {
-            return Err(CommonError::bad_token());
+            return Ok(LoginResult::BadToken);
         }
 
         let mut data = self.data().await;
@@ -327,7 +319,7 @@ impl BaseClient {
         self.login(request).await
     }
 
-    pub async fn password_login(&mut self, md5_password: [u8; 16]) -> Result<(), CommonError> {
+    pub async fn password_login(&mut self, md5_password: [u8; 16]) -> Result<LoginResult, Error> {
         let mut data = self.data().await;
         data.sig.session = rand::random::<[u8; 4]>();
         data.sig.randkey = rand::random::<[u8; 16]>();
@@ -373,18 +365,14 @@ impl BaseClient {
         self.login(request).await
     }
 
-    pub async fn qrcode_login(&mut self) -> Result<(), CommonError> {
+    pub async fn qrcode_login(&mut self) -> Result<LoginResult, Error> {
         if let Some((retcode, uin, t106, t16a, t318, tgtgt)) = self.verify_qrcode().await? {
             let mut data = self.data().await;
             data.sig.qrsig = None;
 
             if retcode == 0 {
                 if uin != data.uin {
-                    let _ = self.error_tx.send(InternalErrorKind::Qrcode(
-                        retcode,
-                        format!("扫码账号({})与登录账号({})不符", uin, data.uin),
-                    ));
-                    return Ok(());
+                    return Ok(LoginResult::QrcodeUinNotMatched(uin, data.uin));
                 }
 
                 data.sig.tgtgt = tgtgt;
@@ -422,25 +410,22 @@ impl BaseClient {
                 let request = data.build_login_request(LoginCommand::WtLoginLogin, body, None)?;
                 drop(data);
 
-                self.login(request).await?;
+                self.login(request).await
             } else {
-                let msg = match retcode {
-                    0x11 => "二维码超时，请重新获取",
-                    0x30 => "二维码尚未扫描",
-                    0x35 => "二维码尚未确认",
-                    0x36 => "二维码被取消，请重新获取",
-                    _ => "服务器错误，请重新获取",
-                };
-                let _ = self
-                    .error_tx
-                    .send(InternalErrorKind::Qrcode(retcode, msg.to_string()));
+                match retcode {
+                    0x11 => Ok(LoginResult::QrcodeTimeout),
+                    0x30 => Ok(LoginResult::QrcodeNotScanned),
+                    0x35 => Ok(LoginResult::QrcodeNotConfirmed),
+                    0x36 => Ok(LoginResult::QrcodeCancelled),
+                    _ => Ok(LoginResult::QrcodeServerError),
+                }
             }
+        } else {
+            Ok(LoginResult::QrcodeNotScanned)
         }
-
-        Ok(())
     }
 
-    async fn login(&mut self, request: LoginRequest) -> Result<(), CommonError> {
+    async fn login(&mut self, request: LoginRequest) -> Result<LoginResult, Error> {
         let response_body = self
             .networker
             .lock()
@@ -449,13 +434,11 @@ impl BaseClient {
             .await?
             .await?;
 
-        self.decode_login_response(response_body).await?;
-
-        Ok(())
+        self.decode_login_response(response_body).await
     }
 
     #[async_recursion]
-    async fn decode_login_response(&mut self, payload: Vec<u8>) -> Result<(), CommonError> {
+    async fn decode_login_response(&mut self, payload: Vec<u8>) -> Result<LoginResult, Error> {
         let mut data = self.data().await;
         let decrypted = tea::decrypt(&mut &payload[16..payload.len() - 1], &data.ecdh.share_key)?;
 
@@ -466,11 +449,7 @@ impl BaseClient {
         let mut t = cursor.read_tlv()?;
 
         if typee == 204 {
-            info!("unlocking...");
-
-            data.sig.t104 = t
-                .remove(&0x104)
-                .ok_or(CommonError::tag_not_existed(0x104))?;
+            data.sig.t104 = t.remove(&0x104).ok_or(TlvError::TagNotExisted(0x104))?;
 
             let mut body = Vec::with_capacity(500);
             body.write_u16(20)?;
@@ -483,55 +462,44 @@ impl BaseClient {
             let request = data.build_login_request(LoginCommand::WtLoginLogin, body, None)?;
             drop(data);
 
-            self.login(request).await?;
-            Ok(())
+            self.login(request).await
         } else if typee == 0 {
             data.sig.t104.clear();
             data.sig.t174.clear();
 
-            let t119 = t
-                .remove(&0x119)
-                .ok_or(CommonError::tag_not_existed(0x119))?;
+            let t119 = t.remove(&0x119).ok_or(TlvError::TagNotExisted(0x119))?;
             let user = data.decode_t119(t119)?;
             drop(data);
 
             let registered = self.register.lock().await.register().await?;
             if registered {
-                let _ = self.online_tx.send(user);
+                Ok(LoginResult::Succeeded(user))
+            } else {
+                Ok(LoginResult::BadToken)
             }
-
-            Ok(())
         } else if typee == 15 || typee == 16 {
-            let _ = self.error_tx.send(InternalErrorKind::Token);
-            Ok(())
+            Ok(LoginResult::BadToken)
         } else if typee == 2 {
-            data.sig.t104 = t
-                .remove(&0x104)
-                .ok_or(CommonError::tag_not_existed(0x104))?;
+            data.sig.t104 = t.remove(&0x104).ok_or(TlvError::TagNotExisted(0x104))?;
 
             if let Some(t192) = t.remove(&0x192) {
-                let _ = self.slider_tx.send(String::from_utf8(t192)?);
+                Ok(LoginResult::SliderAuthorizationRequired(String::from_utf8(
+                    t192,
+                )?))
             } else {
-                let _ = self.error_tx.send(InternalErrorKind::UnknownLoginType(
-                    typee,
-                    "[登陆失败] 未知格式的验证码".to_string(),
-                ));
-            };
-
-            Ok(())
+                Ok(LoginResult::UnknownLoginType(typee))
+            }
         } else if typee == 160 {
             let t204 = t.remove(&0x204);
             let t174 = t.remove(&0x174);
             if t204.is_none() && t174.is_none() {
                 info!("已向密保手机发送短信验证码");
-                return Ok(());
+                return Ok(LoginResult::PhoneSecurityCodeSent);
             }
 
             let t178 = t.remove(&0x178);
             let phone = if let (Some(t174), Some(t178)) = (t174, t178) {
-                data.sig.t104 = t
-                    .remove(&0x104)
-                    .ok_or(CommonError::tag_not_existed(0x104))?;
+                data.sig.t104 = t.remove(&0x104).ok_or(TlvError::TagNotExisted(0x104))?;
                 data.sig.t174 = t174;
 
                 Some(String::from_utf8(data.sig.t174.clone())?)
@@ -542,9 +510,8 @@ impl BaseClient {
             let t204 = t
                 .remove(&0x204)
                 .and_then(|buf| String::from_utf8(buf).or::<String>(Ok(String::new())).ok());
-            let _ = self.verify_tx.send((t204, phone));
 
-            Ok(())
+            Ok(LoginResult::SecurityAuthorizationRequired(t204, phone))
         } else if t.contains_key(&0x149) {
             let t149 = t.remove(&0x149).unwrap();
             let reader = &mut &t149[2..];
@@ -553,11 +520,8 @@ impl BaseClient {
             let title = String::from_utf8(reader.read_bytes(len as usize)?)?;
             let len = reader.read_u16()?;
             let content = String::from_utf8(reader.read_bytes(len as usize)?)?;
-            let _ = self.error_tx.send(InternalErrorKind::UnknownLoginType(
-                typee,
-                format!("[{}] {}", title, content),
-            ));
-            Ok(())
+
+            Ok(LoginResult::Failure(title, content))
         } else if t.contains_key(&0x146) {
             let t146 = t.remove(&0x146).unwrap();
             let reader = &mut &t146[4..];
@@ -566,22 +530,17 @@ impl BaseClient {
             let title = String::from_utf8(reader.read_bytes(len as usize)?)?;
             let len = reader.read_u16()?;
             let content = String::from_utf8(reader.read_bytes(len as usize)?)?;
-            let _ = self.error_tx.send(InternalErrorKind::UnknownLoginType(
-                typee,
-                format!("[{}] {}", title, content),
-            ));
 
-            Ok(())
+            Ok(LoginResult::Failure(title, content))
         } else {
-            let _ = self.error_tx.send(InternalErrorKind::UnknownLoginType(
-                typee,
-                "[登陆失败] 未知错误".to_string(),
-            ));
-            Ok(())
+            Ok(LoginResult::Failure(
+                "登录失败".to_string(),
+                "未知错误".to_string(),
+            ))
         }
     }
 
-    pub async fn fetch_qrcode(&self) -> Result<(), CommonError> {
+    pub async fn fetch_qrcode(&self) -> Result<Vec<u8>, Error> {
         let mut data = self.data().await;
         let mut body = Vec::with_capacity(1024);
         body.write_u16(0)?;
@@ -624,20 +583,15 @@ impl BaseClient {
         if retcode == 0 && t.contains_key(&0x17) {
             let t17 = t.remove(&0x17).unwrap();
             self.data().await.sig.qrsig = Some(qrsig);
-            let _ = self.qrcode_tx.send(t17);
+            Ok(t17)
         } else {
-            let _ = self.error_tx.send(InternalErrorKind::Qrcode(
-                retcode,
-                "获取二维码失败，请重试".to_string(),
-            ));
+            Err(ClientError::FetchQrcodeFailure)?
         }
-
-        Ok(())
     }
 
     pub async fn verify_qrcode(
         &self,
-    ) -> Result<Option<(u8, u32, Vec<u8>, Vec<u8>, Vec<u8>, [u8; 16])>, CommonError> {
+    ) -> Result<Option<(u8, u32, Vec<u8>, Vec<u8>, Vec<u8>, [u8; 16])>, Error> {
         let mut data = self.data().await;
         if let Some(qrsig) = &data.sig.qrsig {
             let mut body = Vec::with_capacity(26 + qrsig.len());
@@ -734,6 +688,17 @@ pub struct User {
     pub gender: u8,
     pub age: u8,
 }
+
+impl Display for User {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("nickname: {}\n", self.nickname))?;
+        f.write_fmt(format_args!("gender: {}\n", self.gender))?;
+        f.write_fmt(format_args!("age: {}\n", self.age))?;
+        f.write_fmt(format_args!("token: {}\n", base64::encode(&self.token)))?;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct DataCenter {
     pub pskey: HashMap<String, Vec<u8>>,
@@ -773,7 +738,7 @@ impl DataCenter {
         command: LoginCommand,
         body: B,
         typee: Option<CommandType>,
-    ) -> Result<LoginRequest, CommonError>
+    ) -> Result<LoginRequest, Error>
     where
         B: AsRef<[u8]>,
     {
@@ -867,7 +832,7 @@ impl DataCenter {
         cmd_id: u16,
         head: u32,
         body: B,
-    ) -> Result<LoginRequest, CommonError> {
+    ) -> Result<LoginRequest, Error> {
         let body = body.as_ref();
         let mut buf = Vec::with_capacity(62 + body.len());
         buf.write_u32(head)?;
@@ -895,7 +860,7 @@ impl DataCenter {
         command: UniCommand,
         body: B,
         seq: Option<u32>,
-    ) -> Result<UniRequest, CommonError>
+    ) -> Result<UniRequest, Error>
     where
         B: AsRef<[u8]>,
     {
@@ -929,7 +894,7 @@ impl DataCenter {
         Ok(UniRequest::new(seq, command, payload))
     }
 
-    fn build_register_request(&mut self, logout: bool) -> Result<LoginRequest, CommonError> {
+    fn build_register_request(&mut self, logout: bool) -> Result<LoginRequest, Error> {
         let pb_buf = protobuf::encode(&ProtobufObject::from([(
             1,
             ProtobufElement::from([
@@ -1005,26 +970,18 @@ impl DataCenter {
         Ok(pkt)
     }
 
-    fn decode_t119<B>(&mut self, t119: B) -> Result<User, CommonError>
+    fn decode_t119<B>(&mut self, t119: B) -> Result<User, Error>
     where
         B: AsRef<[u8]>,
     {
         let decrypted = tea::decrypt(t119, &self.sig.tgtgt)?;
         let mut t = (&mut &decrypted[2..]).read_tlv()?;
 
-        self.sig.tgt = t
-            .remove(&0x10a)
-            .ok_or(CommonError::tag_not_existed(0x10a))?;
-        self.sig.skey = t
-            .remove(&0x120)
-            .ok_or(CommonError::tag_not_existed(0x120))?;
-        self.sig.d2 = t
-            .remove(&0x143)
-            .ok_or(CommonError::tag_not_existed(0x143))?;
-        self.sig.d2key = t
-            .remove(&0x305)
-            .ok_or(CommonError::tag_not_existed(0x305))?[..16]
-            .try_into()?;
+        self.sig.tgt = t.remove(&0x10a).ok_or(TlvError::TagNotExisted(0x10a))?;
+        self.sig.skey = t.remove(&0x120).ok_or(TlvError::TagNotExisted(0x120))?;
+        self.sig.d2 = t.remove(&0x143).ok_or(TlvError::TagNotExisted(0x143))?;
+        self.sig.d2key =
+            t.remove(&0x305).ok_or(TlvError::TagNotExisted(0x305))?[..16].try_into()?;
         self.sig.tgtgt = md5::compute(&self.sig.d2key).0;
         self.sig.emp_time = current_unix_timestamp_as_secs();
 
@@ -1050,9 +1007,7 @@ impl DataCenter {
         token.extend(&self.sig.d2key);
         token.extend(&self.sig.d2);
         token.extend(&self.sig.tgt);
-        let ddd = t
-            .remove(&0x11a)
-            .ok_or(CommonError::tag_not_existed(0x11a))?;
+        let ddd = t.remove(&0x11a).ok_or(TlvError::TagNotExisted(0x11a))?;
         let age = ddd[2];
         let gender = ddd[3];
         let nickname = String::from_utf8(ddd[5..].to_vec())?;
@@ -1071,34 +1026,23 @@ struct Networker {
     data: Arc<Mutex<DataCenter>>,
     network: Network,
     registered: AtomicBool,
-
-    error_tx: Sender<InternalErrorKind>,
 }
 
 impl Networker {
-    fn new(
-        statistics: Arc<Mutex<Statistics>>,
-        data: Arc<Mutex<DataCenter>>,
-        error_tx: Sender<InternalErrorKind>,
-    ) -> Self {
+    fn new(statistics: Arc<Mutex<Statistics>>, data: Arc<Mutex<DataCenter>>) -> Self {
         Self {
             network: Network::new(Arc::clone(&data), statistics),
             data,
             registered: AtomicBool::new(false),
-            error_tx,
         }
     }
 
-    fn on_sso(&self) -> Receiver<(u32, String, Vec<u8>)> {
+    fn on_sso(&self) -> Receiver<SSO> {
         self.network.on_sso()
     }
 
     fn on_state(&self) -> Receiver<(NetworkState, Option<SocketAddr>)> {
         self.network.on_state()
-    }
-
-    fn on_error(&self) -> Receiver<CommonError> {
-        self.network.on_error()
     }
 
     fn registered(&self) -> bool {
@@ -1109,18 +1053,18 @@ impl Networker {
         self.registered.store(registered, Ordering::Relaxed);
     }
 
-    async fn connect(&mut self) -> Result<(), CommonError> {
+    async fn connect(&mut self) -> Result<(), Error> {
         self.network.connect().await?;
         self.sync_time_diff().await
     }
 
-    async fn disconnect(&mut self) -> Result<(), CommonError> {
+    async fn disconnect(&mut self) -> Result<(), Error> {
         self.network.disconnect().await
     }
 }
 
 impl Networker {
-    async fn sync_time_diff(&mut self) -> Result<(), CommonError> {
+    async fn sync_time_diff(&mut self) -> Result<(), Error> {
         let request_packet = self.data.lock().await.build_login_request(
             LoginCommand::ClientCorrectTime,
             BUF_4,
@@ -1143,7 +1087,7 @@ impl Networker {
         &mut self,
         request: B,
         timeout: Option<Duration>,
-    ) -> Result<Response, CommonError>
+    ) -> Result<Response, Error>
     where
         B: Request,
     {
@@ -1153,18 +1097,14 @@ impl Networker {
     }
 
     /// 不等待返回结果
-    async fn write_request<B>(&mut self, request: B) -> Result<(), CommonError>
+    async fn write_request<B>(&mut self, request: B) -> Result<(), Error>
     where
         B: Request,
     {
         self.network.write_request(request).await
     }
 
-    async fn register(
-        &mut self,
-        request: LoginRequest,
-        refresh: bool,
-    ) -> Result<bool, CommonError> {
+    async fn send_register(&mut self, request: LoginRequest, refresh: bool) -> Result<bool, Error> {
         self.set_registered(false);
 
         let request = self
@@ -1176,42 +1116,40 @@ impl Networker {
         if let JceElement::StructBegin(value) = rsp {
             let result = value
                 .get(&9)
-                .ok_or(CommonError::illegal_data())
+                .ok_or(JceError::ItemNotFound(9))
                 .and_then(|e| {
                     if let JceElement::Int8(e) = e {
                         Ok(e)
                     } else {
-                        Err(CommonError::illegal_data())
+                        Err(JceError::NotInt8)
                     }
                 })
                 .and_then(|e| if *e != 0 { Ok(true) } else { Ok(false) })?;
 
             if !result && !refresh {
-                let _ = self.error_tx.send(InternalErrorKind::Token);
                 Ok(false)
             } else {
                 self.set_registered(true);
-                // let heartbeat = Heartbeater::new(Arc::clone(&self.da), networker, token_tx)
                 Ok(true)
             }
         } else {
-            Err(CommonError::illegal_data())
+            Err(JceError::NotStruct)?
         }
     }
 
-    async fn unregister(&mut self, request: LoginRequest) -> Result<(), CommonError> {
+    async fn send_unregister(&mut self, request: LoginRequest) -> Result<(), Error> {
         self.set_registered(false);
         self.write_request(request).await?;
         Ok(())
     }
 
     /// 发送一个业务包但不等待返回
-    pub async fn write_registered_request<B>(&mut self, request: B) -> Result<(), CommonError>
+    pub async fn write_registered_request<B>(&mut self, request: B) -> Result<(), Error>
     where
         B: Request,
     {
         if !self.registered() {
-            return Err(CommonError::not_registered());
+            return Err(ClientError::NotRegistered)?;
         }
 
         self.write_request(request).await?;
@@ -1223,12 +1161,12 @@ impl Networker {
         &mut self,
         request: B,
         timeout: Option<Duration>,
-    ) -> Result<Response, CommonError>
+    ) -> Result<Response, Error>
     where
         B: Request,
     {
         if !self.registered() {
-            return Err(CommonError::not_registered());
+            return Err(ClientError::NotRegistered)?;
         }
 
         let response = self.send_request(request, timeout).await?;
@@ -1246,20 +1184,21 @@ struct Registry {
 }
 
 impl Registry {
-    fn new(
-        data: Arc<Mutex<DataCenter>>,
-        networker: Arc<Mutex<Networker>>,
-        token_tx: Sender<Vec<u8>>,
-    ) -> Self {
+    fn new(data: Arc<Mutex<DataCenter>>, networker: Arc<Mutex<Networker>>) -> Self {
         Self {
             data,
             networker,
-            token_tx,
             heartbeat_handler: None,
+
+            token_tx: sync::broadcast::channel(1).0,
         }
     }
 
-    async fn register(&mut self) -> Result<bool, CommonError> {
+    fn on_token_update(&self) -> Receiver<Vec<u8>> {
+        self.token_tx.subscribe()
+    }
+
+    async fn register(&mut self) -> Result<bool, Error> {
         if self.networker.lock().await.registered() {
             return Ok(true);
         }
@@ -1270,7 +1209,12 @@ impl Registry {
         }
 
         let request = self.data.lock().await.build_register_request(false)?;
-        let registered = self.networker.lock().await.register(request, false).await?;
+        let registered = self
+            .networker
+            .lock()
+            .await
+            .send_register(request, false)
+            .await?;
         if registered {
             let heartbeater = Heartbeater::new(
                 Arc::clone(&self.data),
@@ -1283,7 +1227,7 @@ impl Registry {
         Ok(registered)
     }
 
-    async fn unregister(&mut self) -> Result<(), CommonError> {
+    async fn unregister(&mut self) -> Result<(), Error> {
         if !self.networker.lock().await.registered() {
             return Ok(());
         }
@@ -1294,7 +1238,7 @@ impl Registry {
         };
 
         let request = self.data.lock().await.build_register_request(true)?;
-        self.networker.lock().await.unregister(request).await?;
+        self.networker.lock().await.send_unregister(request).await?;
         Ok(())
     }
 }
@@ -1336,7 +1280,7 @@ impl Heartbeater {
         })
     }
 
-    async fn refresh_token(&mut self) -> Result<(), CommonError> {
+    async fn refresh_token(&mut self) -> Result<(), Error> {
         let mut data = self.data.lock().await;
 
         if current_unix_timestamp_as_secs() - data.sig.emp_time < 14000 {
@@ -1380,13 +1324,16 @@ impl Heartbeater {
         let typee = decrypted[2];
         let mut t = (&mut &decrypted[5..]).read_tlv()?;
         if typee == 0 {
-            let t119 = t
-                .remove(&0x119)
-                .ok_or(CommonError::new("tag 0x119 not existed"))?;
+            let t119 = t.remove(&0x119).ok_or(TlvError::TagNotExisted(0x119))?;
             let user = self.data.lock().await.decode_t119(t119)?;
 
             let request = self.data.lock().await.build_register_request(false)?;
-            let registered = self.networker.lock().await.register(request, true).await?;
+            let registered = self
+                .networker
+                .lock()
+                .await
+                .send_register(request, true)
+                .await?;
 
             if registered {
                 let _ = self.token_tx.send(user.token);
@@ -1397,7 +1344,7 @@ impl Heartbeater {
     }
 
     #[async_recursion]
-    async fn beat(&mut self) -> Result<(), CommonError> {
+    async fn beat(&mut self) -> Result<(), Error> {
         self.networker.lock().await.sync_time_diff().await?;
 
         let request_packet = self.data.lock().await.build_uni_request(
@@ -1422,7 +1369,7 @@ impl Heartbeater {
                 error!("heartbeat timeout, retried count: {}", self.retried);
 
                 if self.retried >= 2 {
-                    Err(CommonError::new("connection lost"))
+                    Err(ClientError::HeartbeatFailure)?
                 } else {
                     self.beat().await
                 }
@@ -1435,65 +1382,55 @@ impl Heartbeater {
 mod tests {
     use std::{fs, time::Duration};
 
+    use log::info;
+
     use crate::{
-        core::{error::CommonError, io::WriteExt},
+        core::{error::Error, io::WriteExt},
         init_logger,
     };
 
-    use super::BaseClient;
+    use super::{BaseClient, ClientError, LoginResult};
 
     #[tokio::test]
-    async fn test_fetch_qrcode() -> Result<(), CommonError> {
+    async fn test_fetch_qrcode() -> Result<(), Error> {
         init_logger();
 
         let mut base_client = BaseClient::default(640279992).await;
 
-        let mut qrcode_rx = base_client.qrcode_tx.subscribe();
-        let handler_0 = tokio::spawn(async move {
-            if let Ok(qrcode) = qrcode_rx.recv().await {
-                let mut file = fs::OpenOptions::new()
-                    .append(false)
-                    .create(true)
-                    .write(true)
-                    .open("./1.jpeg")
-                    .unwrap();
-                let _ = file.write_bytes(&qrcode);
-            }
-        });
-
-        let mut error_rx = base_client.on_error();
-        let handler_1 = tokio::spawn(async move {
-            while let Ok(err) = error_rx.recv().await {
-                match err {
-                    super::InternalErrorKind::Token => println!("token"),
-                    super::InternalErrorKind::UnknownLoginType(typee, reason) => {
-                        println!("type: {} error, {}", typee, reason)
-                    }
-                    super::InternalErrorKind::Qrcode(retcode, reason) => {
-                        println!("retcode: {} {}", retcode, reason)
-                    }
-                }
-            }
-        });
-
         base_client.connect().await?;
-        base_client.fetch_qrcode().await?;
-        let _ = handler_0.await;
+        let qrcode = base_client.fetch_qrcode().await?;
+        let mut file = fs::OpenOptions::new()
+            .append(false)
+            .create(true)
+            .write(true)
+            .open("./qrcode.jpeg")
+            .unwrap();
+        let _ = file.write_bytes(&qrcode);
+        info!("Qrcode downloaded");
 
-        let mut online_rx = base_client.online_tx.subscribe();
-        while let Err(_) = online_rx.try_recv() {
-            base_client.qrcode_login().await?;
-            tokio::time::sleep(Duration::from_secs(2)).await;
+        loop {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let result = base_client.qrcode_login().await?;
+            if let LoginResult::Succeeded(user) = result {
+                println!("{}", user);
+                break;
+            } else if let LoginResult::QrcodeNotScanned = result {
+                continue;
+            } else if let LoginResult::QrcodeNotConfirmed = result {
+                continue;
+            } else {
+                panic!("login failure: {:?}", result)
+            }
         }
+
         base_client.disconnect().await?;
         drop(base_client);
-        let _ = handler_1.await;
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test() -> Result<(), CommonError> {
+    async fn test() -> Result<(), Error> {
         init_logger();
 
         let base_client = BaseClient::default(1313).await;

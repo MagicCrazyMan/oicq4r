@@ -1,10 +1,12 @@
 use flate2::Decompress;
 use hyper::{body::to_bytes, Body, Client};
 use hyper_tls::HttpsConnector;
-use log::debug;
+use log::{debug, error, info, warn};
+use pin_project_lite::pin_project;
 use std::{
     borrow::BorrowMut,
     collections::HashMap,
+    fmt::Display,
     future::Future,
     io::{Cursor, Read, Seek, SeekFrom, Write},
     net::{Shutdown, SocketAddr, TcpStream},
@@ -15,18 +17,55 @@ use std::{
 };
 use tokio::sync::{
     broadcast::{self, Sender},
-    Mutex,
+    Mutex, MutexGuard,
 };
 
 use crate::core::helper::BUF_16;
 
 use super::{
     base_client::{DataCenter, Statistics},
-    error::CommonError,
+    error::Error,
     io::ReadExt,
     jce::{decode_wrapper, encode_wrapper, JceElement},
     tea::{decrypt, encrypt},
 };
+
+#[derive(Debug)]
+pub enum NetworkError {
+    RequestTimeout,
+    RequestUnexpectedLocked,
+    AlreadyConnectedOrConnecting,
+    NotConnected,
+    UnknownFlag(u8),
+    UnknownCompressedFlag(i32),
+    UnsuccessfulRetcode(i32),
+    InvalidatedData,
+}
+
+impl std::error::Error for NetworkError {}
+
+impl Display for NetworkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NetworkError::RequestTimeout => f.write_str("request timeout."),
+            NetworkError::RequestUnexpectedLocked => f.write_str("request unexpected locked."),
+            NetworkError::AlreadyConnectedOrConnecting => {
+                f.write_str("already connected or connecting.")
+            }
+            NetworkError::NotConnected => f.write_str("not connected."),
+            NetworkError::UnknownFlag(flag) => {
+                f.write_fmt(format_args!("unknown packet flag: {}.", flag))
+            }
+            NetworkError::UnknownCompressedFlag(flag) => {
+                f.write_fmt(format_args!("unknown compressed flag: {}.", flag))
+            }
+            NetworkError::UnsuccessfulRetcode(retcode) => {
+                f.write_fmt(format_args!("unsuccessful retcode flag: {}.", retcode))
+            }
+            NetworkError::InvalidatedData => f.write_str("invalidated decompress data."),
+        }
+    }
+}
 
 static DEFAULT_SERVER: (&'static str, u16) = ("msfwifi.3g.qq.com", 8080);
 
@@ -144,6 +183,13 @@ impl Request for UniRequest {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SSO {
+    pub command: String,
+    pub seq: u32,
+    pub body: Vec<u8>,
+}
+
 #[derive(Debug)]
 struct Polling {
     body: Option<Vec<u8>>,
@@ -159,48 +205,50 @@ impl Polling {
     }
 }
 
-#[derive(Debug)]
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct Response {
-    timeout: Duration,
-    start: Instant,
-    polling: Arc<Mutex<Polling>>,
+pin_project! {
+    #[derive(Debug)]
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
+    pub struct Response {
+        timeout: Duration,
+        start: Instant,
+        polling: Arc<Mutex<Polling>>,
+    }
 }
 
 impl Future for Response {
-    type Output = Result<Vec<u8>, CommonError>;
+    type Output = Result<Vec<u8>, NetworkError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.start.elapsed() >= self.timeout {
-            Poll::Ready(Err(CommonError::new("request timeout")))
+            Poll::Ready(Err(NetworkError::RequestTimeout))
         } else {
-            if let Ok(mut polling) = self.polling.try_lock() {
-                if let Some(body) = polling.body.take() {
-                    Poll::Ready(Ok(body))
-                } else {
-                    polling.waker = Some(cx.waker().clone());
+            loop {
+                if let Ok(mut polling) = self.polling.try_lock() {
+                    if let Some(body) = polling.body.take() {
+                        return Poll::Ready(Ok(body));
+                    } else {
+                        polling.waker = Some(cx.waker().clone());
 
-                    let waker = cx.waker().clone();
-                    let timeout = self.timeout;
-                    tokio::spawn(async move {
-                        tokio::time::sleep(timeout).await;
-                        waker.wake_by_ref();
-                    });
+                        let waker = cx.waker().clone();
+                        let timeout = self.timeout;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(timeout).await;
+                            waker.wake_by_ref();
+                        });
 
-                    Poll::Pending
+                        return Poll::Pending;
+                    }
                 }
-            } else {
-                Poll::Ready(Err(CommonError::new("request locked")))
             }
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkState {
     Closed,
     ///若不是主动关闭连接，该状态则会在 [`NetworkState::Closed`] 后触发
-    Lost,
+    Lost(Option<String>),
     Connecting,
     Connected,
 }
@@ -221,8 +269,7 @@ pub struct Network {
     auto_search: bool,
 
     state_tx: broadcast::Sender<(NetworkState, Option<SocketAddr>)>,
-    error_tx: broadcast::Sender<CommonError>,
-    sso_tx: broadcast::Sender<(u32, String, Vec<u8>)>,
+    sso_tx: broadcast::Sender<SSO>,
 }
 
 impl Network {
@@ -242,16 +289,11 @@ impl Network {
             auto_search: true,
 
             state_tx: broadcast::channel(1).0,
-            error_tx: broadcast::channel(1).0,
             sso_tx: broadcast::channel(1).0,
         }
     }
 
-    pub fn on_error(&self) -> broadcast::Receiver<CommonError> {
-        self.error_tx.subscribe()
-    }
-
-    pub fn on_sso(&self) -> broadcast::Receiver<(u32, String, Vec<u8>)> {
+    pub fn on_sso(&self) -> broadcast::Receiver<SSO> {
         self.sso_tx.subscribe()
     }
 
@@ -259,18 +301,18 @@ impl Network {
         self.state_tx.subscribe()
     }
 
-    pub async fn state(&self) -> NetworkState {
-        *self.state.lock().await
+    pub async fn state(&self) -> MutexGuard<NetworkState> {
+        self.state.lock().await
     }
 
-    pub async fn connect(&mut self) -> Result<(), CommonError> {
-        let state = self.state().await;
-        if NetworkState::Closed == state {
+    pub async fn connect(&mut self) -> Result<(), Error> {
+        if NetworkState::Closed == *self.state.lock().await {
             *self.close_manually.lock().await = false;
 
             // 更新状态至 Connecting
             *self.state.lock().await = NetworkState::Connecting;
             let _ = self.state_tx.send((NetworkState::Connecting, None));
+            info!("Connecting server...");
 
             // 使用尝试连接服务器
             let tcp = TcpStream::connect(self.resolve_target_sevrer().await?)?;
@@ -283,16 +325,23 @@ impl Network {
 
             // 等待完成初始化后更新状态至 Connected
             *self.state.lock().await = NetworkState::Connected;
+            self.statistics.lock().await.remote_socket_addr = target_server;
             let _ = self.state_tx.send((NetworkState::Connected, target_server));
+            info!(
+                "Connected to server {} successfully",
+                target_server
+                    .and_then(|server| Some(server.to_string()))
+                    .unwrap_or("unknown".to_string())
+            );
 
             Ok(())
         } else {
-            Err(CommonError::from("connected"))
+            Err(Error::from(NetworkError::AlreadyConnectedOrConnecting))
         }
     }
 
-    pub async fn disconnect(&mut self) -> Result<(), CommonError> {
-        if NetworkState::Connected == self.state().await {
+    pub async fn disconnect(&mut self) -> Result<(), Error> {
+        if NetworkState::Connected == *self.state.lock().await {
             *self.close_manually.lock().await = true;
 
             if let Some(stream) = self.tcp_writer.lock().await.take() {
@@ -303,12 +352,12 @@ impl Network {
             // Closed 事件会等待异步线程结束后触发
             Ok(())
         } else {
-            Err(CommonError::from("not connected"))
+            Err(Error::from(NetworkError::NotConnected))
         }
     }
 
-    pub async fn write_request<B: Request>(&mut self, request: B) -> Result<(), CommonError> {
-        if NetworkState::Connected == self.state().await {
+    pub async fn write_request<B: Request>(&mut self, request: B) -> Result<(), Error> {
+        if NetworkState::Connected == *self.state.lock().await {
             let mut writer = self.tcp_writer.lock().await;
             let writer = writer.borrow_mut().as_mut().unwrap();
             writer.write_all(request.payload())?;
@@ -316,14 +365,14 @@ impl Network {
             self.statistics.lock().await.sent_pkt_cnt += 1;
 
             debug!(
-                "sent: {}, seq: {}, len: {}",
+                "Packet write with command: {}, seq: {}, len: {}",
                 request.command(),
                 request.seq(),
                 request.payload().len()
             );
             Ok(())
         } else {
-            Err(CommonError::new("not connected"))
+            Err(Error::from(NetworkError::NotConnected))
         }
     }
 
@@ -331,8 +380,8 @@ impl Network {
         &mut self,
         request: B,
         timeout: Duration,
-    ) -> Result<Response, CommonError> {
-        if NetworkState::Connected == self.state().await {
+    ) -> Result<Response, Error> {
+        if NetworkState::Connected == *self.state.lock().await {
             let response = Response {
                 timeout,
                 start: Instant::now(),
@@ -350,7 +399,7 @@ impl Network {
             self.statistics.lock().await.sent_pkt_cnt += 1;
 
             debug!(
-                "sent: {}, seq: {}, len: {}, timeout: {}s",
+                "Packet sent with command: {}, seq: {}, len: {}, timeout: {}s",
                 request.command(),
                 request.seq(),
                 request.payload().len(),
@@ -358,11 +407,11 @@ impl Network {
             );
             Ok(response)
         } else {
-            Err(CommonError::new("not connected"))
+            Err(Error::from(NetworkError::NotConnected))
         }
     }
 
-    async fn resolve_target_sevrer(&mut self) -> Result<(&str, u16), CommonError> {
+    async fn resolve_target_sevrer(&mut self) -> Result<(&str, u16), Error> {
         if !self.auto_search {
             return Ok(DEFAULT_SERVER);
         }
@@ -399,7 +448,6 @@ impl Network {
         let polling_requests = Arc::clone(&self.polling_requests);
         let close_manually = Arc::clone(&self.close_manually);
         let state_tx = self.state_tx.clone();
-        let error_tx = self.error_tx.clone();
         let sso_tx = self.sso_tx.clone();
 
         std::thread::spawn(move || {
@@ -434,7 +482,7 @@ impl Network {
                                     sso_tx.clone(),
                                     packet_buf,
                                 ) {
-                                    e = Some(err);
+                                    error!("Packet decode error: {} ", err);
                                     break;
                                 }
                             } else {
@@ -443,28 +491,41 @@ impl Network {
                         }
                     }
                     Err(err) => {
-                        e = Some(CommonError::from(err));
+                        e = Some(Error::from(err));
                         break;
                     }
                 }
             }
 
-            if let Some(err) = e {
-                let _ = error_tx.send(err);
+            if !*close_manually.blocking_lock() {
+                let msg = e.and_then(|e| Some(e.to_string()));
+
+                *state.blocking_lock() = NetworkState::Lost(msg.clone());
+                statistics.blocking_lock().lost_times += 1;
+                let _ = state_tx.send((NetworkState::Lost(msg.clone()), remote_addr));
+                error!(
+                    "Connection lost: {}, reason: {}.",
+                    remote_addr
+                        .and_then(|server| Some(server.to_string()))
+                        .unwrap_or("unknown".to_string()),
+                    msg.unwrap_or("unknown".to_string())
+                );
             }
 
             *state.blocking_lock() = NetworkState::Closed;
+            statistics.blocking_lock().remote_socket_addr = None;
             let _ = state_tx.send((NetworkState::Closed, remote_addr));
-
-            if !*close_manually.blocking_lock() {
-                *state.blocking_lock() = NetworkState::Lost;
-                let _ = state_tx.send((NetworkState::Lost, remote_addr));
-            }
+            warn!(
+                "Connection closed: {}.",
+                remote_addr
+                    .and_then(|server| Some(server.to_string()))
+                    .unwrap_or("unknown".to_string())
+            );
         })
     }
 }
 
-async fn update_server_list() -> Result<Vec<(String, u16)>, CommonError> {
+async fn update_server_list() -> Result<Vec<(String, u16)>, Error> {
     let request_body = encode_wrapper(
         UPDATE_SEVER_REQUEST,
         "ConfigHttp",
@@ -495,27 +556,30 @@ async fn update_server_list() -> Result<Vec<(String, u16)>, CommonError> {
 
         value
             .remove(&2)
-            .ok_or(CommonError::illegal_data())
+            .ok_or(Error::from(NetworkError::InvalidatedData))
             .and_then(|value| {
                 if let JceElement::List(value) = value {
                     Ok(value)
                 } else {
-                    Err(CommonError::illegal_data())
+                    Err(Error::from(NetworkError::InvalidatedData))
                 }
             })
             .and_then(|value| {
                 value.into_iter().try_for_each(|ele| {
                     if let JceElement::StructBegin(mut ele) = ele {
-                        let address =
-                            String::try_from(ele.remove(&1).ok_or(CommonError::illegal_data())?)?;
-                        let port =
-                            i16::try_from(ele.remove(&2).ok_or(CommonError::illegal_data())?)?
-                                as u16;
+                        let address = String::try_from(
+                            ele.remove(&1)
+                                .ok_or(Error::from(NetworkError::InvalidatedData))?,
+                        )?;
+                        let port = i16::try_from(
+                            ele.remove(&2)
+                                .ok_or(Error::from(NetworkError::InvalidatedData))?,
+                        )? as u16;
 
                         list.push((address, port));
                         Ok(())
                     } else {
-                        Err(CommonError::illegal_data())
+                        Err(Error::from(NetworkError::InvalidatedData))
                     }
                 })?;
                 Ok(())
@@ -523,7 +587,7 @@ async fn update_server_list() -> Result<Vec<(String, u16)>, CommonError> {
 
         Ok(list)
     } else {
-        Err(CommonError::illegal_data())
+        Err(Error::from(NetworkError::InvalidatedData))
     }
 }
 
@@ -531,9 +595,9 @@ async fn update_server_list() -> Result<Vec<(String, u16)>, CommonError> {
 fn decode_packet(
     data: Arc<Mutex<DataCenter>>,
     polling_requests: Arc<Mutex<HashMap<u32, Weak<Mutex<Polling>>>>>,
-    sso_tx: Sender<(u32, String, Vec<u8>)>,
+    sso_tx: Sender<SSO>,
     packet: Vec<u8>,
-) -> Result<(), CommonError> {
+) -> Result<(), Error> {
     let flag = packet[4];
     let offset = u32::from_be_bytes(packet[6..10].try_into()?);
     let encrypted = packet[offset as usize + 6..].to_vec();
@@ -544,23 +608,23 @@ fn decode_packet(
         2 => decrypt(&encrypted, &BUF_16)?,
         _ => {
             // let _ = error_tx.send(InternalErrorKind::Token);
-            return Err(CommonError::new(format!("unknown flag: {}", flag)));
+            return Err(Error::from(NetworkError::UnknownFlag(flag)));
         }
     };
 
     let sso = parse_sso(decrypted.as_slice())?;
     debug!(
-        "recv: {}, seq: {}, raw_len: {}, decoded_len: {}",
-        sso.1.as_str(),
-        sso.0,
+        "Packet received with command {}, seq: {}, raw_len: {}, decoded_len: {}",
+        &sso.command,
+        sso.seq,
         packet.len(),
-        sso.2.len()
+        sso.body.len()
     );
 
     let mut polling_requests = polling_requests.blocking_lock();
-    if let Some(polling) = polling_requests.remove(&sso.0).and_then(|p| p.upgrade()) {
+    if let Some(polling) = polling_requests.remove(&sso.seq).and_then(|p| p.upgrade()) {
         let mut polling = polling.blocking_lock();
-        polling.body = Some(sso.2);
+        polling.body = Some(sso.body);
 
         if let Some(waker) = &polling.waker {
             waker.wake_by_ref();
@@ -573,7 +637,7 @@ fn decode_packet(
 }
 
 #[inline]
-fn parse_sso(buf: &[u8]) -> Result<(u32, String, Vec<u8>), CommonError> {
+fn parse_sso(buf: &[u8]) -> Result<SSO, Error> {
     let mut z_decompress = Decompress::new(true);
     let mut reader = Cursor::new(buf);
     let head_len = reader.read_u32()? as usize;
@@ -581,21 +645,19 @@ fn parse_sso(buf: &[u8]) -> Result<(u32, String, Vec<u8>), CommonError> {
     let retcode = reader.read_i32()?;
 
     if retcode != 0 {
-        Err(CommonError::new(format!(
-            "unsuccessful retcode: {}",
-            retcode
-        )))
+        Err(Error::from(NetworkError::UnsuccessfulRetcode(retcode)))
     } else {
         let offset = reader.read_u32()? as i64;
         reader.seek(SeekFrom::Current(offset - 4))?;
 
         let len = reader.read_u32()? as usize;
-        let cmd = String::from_utf8(reader.read_bytes(len)?)?;
+        let command = String::from_utf8(reader.read_bytes(len - 4)?)?;
 
-        reader.seek(SeekFrom::Current(4))?;
+        let skip = reader.read_u32()? as i64;
+        reader.seek(SeekFrom::Current(skip - 4))?;
         let flag = reader.read_i32()?;
 
-        let payload = match flag {
+        let body = match flag {
             0 => buf[head_len + 4..].to_vec(),
             1 => {
                 let mut decompressed = Vec::with_capacity(buf.len() - head_len - 4 + 512);
@@ -606,26 +668,18 @@ fn parse_sso(buf: &[u8]) -> Result<(u32, String, Vec<u8>), CommonError> {
                 ) {
                     Ok(status) => match status {
                         flate2::Status::Ok => decompressed,
-                        flate2::Status::BufError => {
-                            return Err(CommonError::new("decompress buf error"))
-                        }
-                        flate2::Status::StreamEnd => {
-                            return Err(CommonError::new("decompress stream error"))
-                        }
+                        _ => return Err(Error::from(NetworkError::InvalidatedData)),
                     },
-                    Err(err) => return Err(CommonError::from(err)),
+                    Err(err) => return Err(Error::from(err)),
                 }
             }
             8 => buf[head_len..].to_vec(),
             _ => {
-                return Err(CommonError::new(format!(
-                    "unknown compressed flag: {}",
-                    flag
-                )));
+                return Err(Error::from(NetworkError::UnknownCompressedFlag(flag)));
             }
         };
 
-        Ok((seq, cmd, payload))
+        Ok(SSO { seq, command, body })
     }
 }
 // #[cfg(test)]

@@ -1,23 +1,49 @@
 use std::{
     collections::HashMap,
+    fmt::Display,
     io::{Read, Write},
 };
 
 use super::{
     base_client::DataCenter,
     device::Platform,
-    error::CommonError,
+    error::Error,
     helper::{current_unix_timestamp_as_millis, BUF_0, BUF_1, BUF_4},
     io::WriteExt,
     protobuf::{encode, ProtobufElement, ProtobufObject},
     tea::{self, encrypt},
 };
 
-trait PartialSlice {
+#[derive(Debug)]
+pub enum TlvError {
+    InvalidData,
+    PasswordNotProvided,
+    CodeNotProvided,
+    TicketNotProvided,
+    TagNotExisted(i32),
+}
+
+impl std::error::Error for TlvError {}
+
+impl Display for TlvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TlvError::PasswordNotProvided => f.write_str("password not provided."),
+            TlvError::CodeNotProvided => f.write_str("code not provided."),
+            TlvError::TicketNotProvided => f.write_str("ticket not provided."),
+            TlvError::InvalidData => f.write_str("invalidate data."),
+            TlvError::TagNotExisted(tag) => {
+                f.write_fmt(format_args!("tag 0x:{:x} not existed", tag))
+            }
+        }
+    }
+}
+
+trait MaximumSlice {
     fn partial_slice(&self, max: usize) -> &str;
 }
 
-impl<T: AsRef<str>> PartialSlice for T {
+impl<T: AsRef<str>> MaximumSlice for T {
     fn partial_slice(&self, max: usize) -> &str {
         let str = self.as_ref();
         let len = if str.len() > max { max } else { str.len() };
@@ -32,7 +58,7 @@ fn pack_body(
     md5_password: Option<[u8; 16]>,
     code: Option<Vec<u8>>,
     ticket: Option<Vec<u8>>,
-) -> Result<Vec<u8>, CommonError> {
+) -> Result<Vec<u8>, Error> {
     let result = match tag {
         0x01 => {
             let mut writer = Vec::with_capacity(2 + 4 + 4 + 4 + 4 + 2);
@@ -130,7 +156,7 @@ fn pack_body(
         }
         0x104 => data.sig.t104.clone(),
         0x106 => {
-            let md5_password = md5_password.ok_or(CommonError::new("no password provided"))?;
+            let md5_password = md5_password.ok_or(TlvError::PasswordNotProvided)?;
             let mut body = Vec::with_capacity(
                 2 + 4 + 4 + 4 + 4 + 8 + 4 + 4 + 1 + 16 + 16 + 4 + 1 + 16 + 4 + 4 + 2 + 4 + 2 + 24,
             );
@@ -259,7 +285,7 @@ fn pack_body(
         }
         0x17a => 9u32.to_be_bytes().to_vec(),
         0x17c => {
-            let code = code.ok_or(CommonError::new("code not provided"))?;
+            let code = code.ok_or(TlvError::CodeNotProvided)?;
             let mut writer = Vec::with_capacity(2 + code.len());
             writer.write_tlv(code)?;
             writer
@@ -267,7 +293,7 @@ fn pack_body(
         0x187 => md5::compute(&data.device.mac_address).0.to_vec(),
         0x188 => md5::compute(&data.device.android_id).0.to_vec(),
         0x191 => 0x82u8.to_be_bytes().to_vec(),
-        0x193 => ticket.ok_or(CommonError::new("ticket not provided"))?,
+        0x193 => ticket.ok_or(TlvError::TicketNotProvided)?,
         0x194 => data.device.imsi.to_vec(),
         0x197 | 0x198 => {
             let mut writer = Vec::with_capacity(2 + 1);
@@ -350,13 +376,13 @@ fn pack_body(
 
             buf
         }
-        _ => return Err(CommonError::from("Invalid Input")),
+        _ => return Err(Error::from(TlvError::InvalidData)),
     };
 
     Ok(result)
 }
 
-pub fn pack(data: &DataCenter, tag: u16) -> Result<Vec<u8>, CommonError> {
+pub fn pack(data: &DataCenter, tag: u16) -> Result<Vec<u8>, Error> {
     pack_with_args(data, tag, None, None, None, None)
 }
 
@@ -367,7 +393,7 @@ pub fn pack_with_args(
     md5_password: Option<[u8; 16]>,
     code: Option<Vec<u8>>,
     ticket: Option<Vec<u8>>,
-) -> Result<Vec<u8>, CommonError> {
+) -> Result<Vec<u8>, Error> {
     let mut body = pack_body(data, tag, emp, md5_password, code, ticket)?;
 
     let a = (body.len() as u16).to_be_bytes();

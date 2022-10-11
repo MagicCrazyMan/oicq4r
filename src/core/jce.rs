@@ -2,11 +2,50 @@ use std::{
     collections::HashMap,
     convert::TryFrom,
     fmt::Display,
-    io::{ErrorKind, Read, Write},
-    string::FromUtf8Error,
+    io::{Read, Write},
 };
 
-use super::io::WriteExt;
+use super::{
+    error::{Error, ErrorKind},
+    io::WriteExt,
+};
+
+#[derive(Debug)]
+pub enum JceError {
+    NotFloat,
+    NotDouble,
+    NotInt64,
+    NotInt32,
+    NotInt16,
+    NotInt8,
+    NotString,
+    NotStruct,
+    TagOverflowed(usize),
+    DecodeError,
+    TypeNotMatched(u8),
+    ItemNotFound(u8),
+}
+
+impl std::error::Error for JceError {}
+
+impl Display for JceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JceError::NotFloat => f.write_str("type of this jce element not Float"),
+            JceError::NotDouble => f.write_str("type of this jce element not Double"),
+            JceError::NotInt64 => f.write_str("type of this jce element not SignedInteger64"),
+            JceError::NotInt32 => f.write_str("type of this jce element not SignedInteger32"),
+            JceError::NotInt16 => f.write_str("type of this jce element not SignedInteger16"),
+            JceError::NotInt8 => f.write_str("type of this jce element not SignedInteger8"),
+            JceError::NotString => f.write_str("type of this jce element not String"),
+            JceError::NotStruct => f.write_str("type of this jce element not Struct"),
+            JceError::TagOverflowed(tag) => f.write_fmt(format_args!("jce tag overflowed, max: 255, current: {}", *tag)),
+            JceError::DecodeError => f.write_str("decode error"),
+            JceError::TypeNotMatched(e) => f.write_fmt(format_args!("type not matched: {}", *e)),
+            JceError::ItemNotFound(e) => f.write_fmt(format_args!("item not found: {}.", *e)),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum Type {
@@ -81,57 +120,6 @@ impl From<&JceElement> for Type {
             JceElement::Map(_) => Self::Map,
             JceElement::StructBegin(_) => Self::StructBegin,
             JceElement::StructEnd => Self::StructEnd,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum JceError {
-    NotFloat,
-    NotDouble,
-    NotSignedInteger64,
-    NotSignedInteger32,
-    NotSignedInteger16,
-    NotSignedInteger8,
-    NotString,
-    IntegerOverflowed,
-    StringOverflowed,
-    DecodeError,
-    TypeNotMatched(u8),
-    Io(std::io::Error),
-    FromUtf8Error(FromUtf8Error),
-}
-
-impl std::error::Error for JceError {}
-
-impl From<FromUtf8Error> for JceError {
-    fn from(error: FromUtf8Error) -> Self {
-        Self::FromUtf8Error(error)
-    }
-}
-
-impl From<std::io::Error> for JceError {
-    fn from(error: std::io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl Display for JceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            JceError::NotFloat => f.write_str("NotFloat"),
-            JceError::NotDouble => f.write_str("NotDouble"),
-            JceError::NotSignedInteger64 => f.write_str("NotSignedInteger64"),
-            JceError::NotSignedInteger32 => f.write_str("NotSignedInteger32"),
-            JceError::NotSignedInteger16 => f.write_str("NotSignedInteger16"),
-            JceError::NotSignedInteger8 => f.write_str("NotSignedInteger8"),
-            JceError::NotString => f.write_str("NotString"),
-            JceError::IntegerOverflowed => f.write_str("IntegerOverflowed"),
-            JceError::StringOverflowed => f.write_str("StringOverflowed"),
-            JceError::DecodeError => f.write_str("DecodeError"),
-            JceError::TypeNotMatched(e) => f.write_fmt(format_args!("TypeNotMatched: {}", *e)),
-            JceError::Io(e) => e.fmt(f),
-            JceError::FromUtf8Error(e) => e.fmt(f),
         }
     }
 }
@@ -263,7 +251,7 @@ impl TryFrom<JceElement> for i64 {
             JceElement::Int16(len) => Ok(len as i64),
             JceElement::Int32(len) => Ok(len as i64),
             JceElement::Int64(len) => Ok(len),
-            _ => Err(JceError::NotSignedInteger64),
+            _ => Err(JceError::NotInt64),
         }
     }
 }
@@ -277,7 +265,7 @@ impl TryFrom<JceElement> for i32 {
             JceElement::Int8(len) => Ok(len as i32),
             JceElement::Int16(len) => Ok(len as i32),
             JceElement::Int32(len) => Ok(len),
-            _ => Err(JceError::NotSignedInteger32),
+            _ => Err(JceError::NotInt32),
         }
     }
 }
@@ -290,7 +278,7 @@ impl TryFrom<JceElement> for i16 {
             JceElement::Zero => Ok(0),
             JceElement::Int8(len) => Ok(len as i16),
             JceElement::Int16(len) => Ok(len),
-            _ => Err(JceError::NotSignedInteger16),
+            _ => Err(JceError::NotInt16),
         }
     }
 }
@@ -302,7 +290,7 @@ impl TryFrom<JceElement> for i8 {
         match value {
             JceElement::Zero => Ok(0),
             JceElement::Int8(len) => Ok(len),
-            _ => Err(JceError::NotSignedInteger8),
+            _ => Err(JceError::NotInt8),
         }
     }
 }
@@ -432,7 +420,7 @@ impl<const N: usize> TryFrom<[Option<JceElement>; N]> for JceObject {
                 }
                 Ok(())
             } else {
-                Err(JceError::IntegerOverflowed)
+                Err(JceError::TagOverflowed(tag))
             }
         })?;
 
@@ -454,7 +442,7 @@ impl std::ops::DerefMut for JceObject {
     }
 }
 
-fn read_head<R>(stream: &mut R) -> Result<(u8, Type), JceError>
+fn read_head<R>(stream: &mut R) -> Result<(u8, Type), Error>
 where
     R: Read,
 {
@@ -472,7 +460,7 @@ where
     Ok((tag, typee))
 }
 
-fn read_body<R>(stream: &mut R, typee: Type) -> Result<JceElement, JceError>
+fn read_body<R>(stream: &mut R, typee: Type) -> Result<JceElement, Error>
 where
     R: Read,
 {
@@ -575,7 +563,7 @@ where
     }
 }
 
-fn read_struct<R>(stream: &mut R) -> Result<JceElement, JceError>
+fn read_struct<R>(stream: &mut R) -> Result<JceElement, Error>
 where
     R: Read,
 {
@@ -592,7 +580,7 @@ where
     Ok(JceElement::StructBegin(result))
 }
 
-fn read_element<R>(stream: &mut R) -> Result<(u8, JceElement), JceError>
+fn read_element<R>(stream: &mut R) -> Result<(u8, JceElement), Error>
 where
     R: Read,
 {
@@ -601,7 +589,7 @@ where
     Ok((tag, element))
 }
 
-fn create_head<W>(stream: &mut W, tag: u8, typee: Type) -> Result<(), JceError>
+fn create_head<W>(stream: &mut W, tag: u8, typee: Type) -> Result<(), Error>
 where
     W: Write,
 {
@@ -615,7 +603,7 @@ where
     Ok(())
 }
 
-fn create_body<W>(stream: &mut W, body: &JceElement) -> Result<(), JceError>
+fn create_body<W>(stream: &mut W, body: &JceElement) -> Result<(), Error>
 where
     W: Write,
 {
@@ -665,7 +653,7 @@ where
     Ok(())
 }
 
-fn create_element<W>(stream: &mut W, tag: u8, element: &JceElement) -> Result<(), JceError>
+fn create_element<W>(stream: &mut W, tag: u8, element: &JceElement) -> Result<(), Error>
 where
     W: Write,
 {
@@ -674,7 +662,7 @@ where
 }
 
 /// 调用此函数进行jce解码
-pub fn decode<R>(source: &mut R) -> Result<JceObject, JceError>
+pub fn decode<R>(source: &mut R) -> Result<JceObject, Error>
 where
     R: Read,
 {
@@ -686,9 +674,9 @@ where
             Ok((tag, element)) => {
                 result.insert(tag, element);
             }
-            Err(error) => match &error {
-                JceError::Io(io_error) => {
-                    if let ErrorKind::UnexpectedEof = io_error.kind() {
+            Err(error) => match &error.kind() {
+                ErrorKind::StdIoError(io_error) => {
+                    if let std::io::ErrorKind::UnexpectedEof = io_error.kind() {
                         break;
                     } else {
                         return Err(error);
@@ -702,32 +690,42 @@ where
     Ok(result)
 }
 
-pub fn decode_wrapper<R>(source: &mut R) -> Result<JceElement, JceError>
+pub fn decode_wrapper<R>(source: &mut R) -> Result<JceElement, Error>
 where
     R: Read,
 {
     let mut wrapper = decode(source)?;
     wrapper
         .remove(&7)
-        .ok_or(JceError::DecodeError)
+        .ok_or(Error::from(JceError::DecodeError))
         .and_then(|ele| {
             if let JceElement::SimpleList(value) = ele {
                 decode(&mut value.as_slice())
             } else {
-                Err(JceError::DecodeError)
+                Err(Error::from(JceError::DecodeError))
             }
         })
-        .and_then(|mut object| object.remove(&0).ok_or(JceError::DecodeError))
+        .and_then(|mut object| {
+            object
+                .remove(&0)
+                .ok_or(Error::from(JceError::DecodeError))
+        })
         .and_then(|map| {
             if let JceElement::Map(value) = map {
-                value.into_values().next().ok_or(JceError::DecodeError)
+                value
+                    .into_values()
+                    .next()
+                    .ok_or(Error::from(JceError::DecodeError))
             } else {
-                Err(JceError::DecodeError)
+                Err(Error::from(JceError::DecodeError))
             }
         })
         .and_then(|nested| {
             if let JceElement::Map(value) = nested {
-                value.into_values().next().ok_or(JceError::DecodeError)
+                value
+                    .into_values()
+                    .next()
+                    .ok_or(Error::from(JceError::DecodeError))
             } else {
                 Ok(nested)
             }
@@ -736,14 +734,18 @@ where
             if let JceElement::SimpleList(value) = nested {
                 decode(&mut value.as_slice())
             } else {
-                Err(JceError::DecodeError)
+                Err(Error::from(JceError::DecodeError))
             }
         })
-        .and_then(|mut object| object.remove(&0).ok_or(JceError::DecodeError))
+        .and_then(|mut object| {
+            object
+                .remove(&0)
+                .ok_or(Error::from(JceError::DecodeError))
+        })
 }
 
 #[cfg(not(debug_assertions))]
-pub fn encode<W>(stream: &mut W, object: &JceObject) -> Result<(), JceError>
+pub fn encode<W>(stream: &mut W, object: &JceObject) -> Result<(), Error>
 where
     W: Write,
 {
@@ -754,7 +756,7 @@ where
 
 /// debug 模式下，HashMap 会按照 key(u8) 排序后生成 JceObject，以方便配合 nodejs debug
 #[cfg(debug_assertions)]
-pub fn encode_stream<W>(stream: &mut W, object: &JceObject) -> Result<(), JceError>
+pub fn encode_stream<W>(stream: &mut W, object: &JceObject) -> Result<(), Error>
 where
     W: Write,
 {
@@ -764,21 +766,18 @@ where
         .try_for_each(|(tag, element)| create_element(stream, *tag, element))
 }
 
-pub fn encode_with_capacity(object: &JceObject, capacity: usize) -> Result<Vec<u8>, JceError> {
+pub fn encode_with_capacity(object: &JceObject, capacity: usize) -> Result<Vec<u8>, Error> {
     let mut encoded = Vec::with_capacity(capacity);
     encode_stream(&mut encoded, object)?;
     Ok(encoded)
 }
 
-pub fn encode(object: &JceObject) -> Result<Vec<u8>, JceError> {
+pub fn encode(object: &JceObject) -> Result<Vec<u8>, Error> {
     encode_with_capacity(object, 50)
 }
 
-pub fn encode_nested(object: JceObject) -> Result<Vec<u8>, JceError> {
-    encode(&JceObject::from([(
-        0,
-        JceElement::StructBegin(object),
-    )]))
+pub fn encode_nested(object: JceObject) -> Result<Vec<u8>, Error> {
+    encode(&JceObject::from([(0, JceElement::StructBegin(object))]))
 }
 
 pub fn encode_wrapper<K, V, M>(
@@ -786,7 +785,7 @@ pub fn encode_wrapper<K, V, M>(
     servant: &str,
     func: &str,
     req_id: Option<i64>,
-) -> Result<Vec<u8>, JceError>
+) -> Result<Vec<u8>, Error>
 where
     K: Into<String>,
     V: Into<JceElement>,
@@ -921,7 +920,7 @@ mod test {
     }
 
     #[test]
-    fn test() -> Result<(), JceError> {
+    fn test() -> Result<(), Error> {
         // let mut a = Vec::with_capacity(200);
         // let value = JceObject::try_from([
         //     None,
@@ -986,7 +985,7 @@ mod test {
     }
 
     #[test]
-    fn test_wrapper() -> Result<(), JceError> {
+    fn test_wrapper() -> Result<(), Error> {
         let map = [(
             "ccc",
             JceElement::from([

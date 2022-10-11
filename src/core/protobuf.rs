@@ -1,11 +1,11 @@
 use std::{
     collections::HashMap,
-    io::{Read, Write},
+    io::{Read, Write}, fmt::Display,
 };
 
 use protobuf::{rt::WireType, CodedInputStream, CodedOutputStream};
 
-use super::error::CommonError;
+use super::error::Error;
 
 #[derive(Debug, Clone)]
 pub enum ProtobufElement {
@@ -120,7 +120,7 @@ pub fn encode_element(
     writer: &mut CodedOutputStream,
     tag: u32,
     element: &ProtobufElement,
-) -> Result<(), CommonError> {
+) -> Result<(), Error> {
     match element {
         ProtobufElement::Null => {}
         ProtobufElement::Integer(value) => {
@@ -157,7 +157,7 @@ pub fn encode_element(
 fn encode_object(
     writer: &mut CodedOutputStream,
     object: &ProtobufObject,
-) -> Result<(), CommonError> {
+) -> Result<(), Error> {
     let mut list = object.iter().collect::<Vec<_>>();
     list.sort_by(|a, b| (*a.0).cmp(b.0));
 
@@ -169,13 +169,13 @@ fn encode_object(
 fn encode_object(
     writer: &mut CodedOutputStream,
     object: &ProtobufObject,
-) -> Result<(), CommonError> {
+) -> Result<(), Error> {
     object
         .iter()
         .try_for_each(|(tag, element)| encode_element(writer, *tag, element))
 }
 
-pub fn encode_stream<W>(writer: &mut W, object: &ProtobufObject) -> Result<(), CommonError>
+pub fn encode_stream<W>(writer: &mut W, object: &ProtobufObject) -> Result<(), Error>
 where
     W: Write,
 {
@@ -186,7 +186,7 @@ where
 pub fn encode_with_capacity(
     object: &ProtobufObject,
     capacity: usize,
-) -> Result<Vec<u8>, CommonError> {
+) -> Result<Vec<u8>, Error> {
     let mut buf = Vec::with_capacity(capacity);
     let mut coded_stream = CodedOutputStream::new(&mut buf);
     encode_object(&mut coded_stream, object)?;
@@ -195,7 +195,7 @@ pub fn encode_with_capacity(
     Ok(buf)
 }
 
-pub fn encode(object: &ProtobufObject) -> Result<Vec<u8>, CommonError> {
+pub fn encode(object: &ProtobufObject) -> Result<Vec<u8>, Error> {
     encode_with_capacity(object, 1000)
 }
 
@@ -243,12 +243,12 @@ pub fn encode(object: &ProtobufObject) -> Result<Vec<u8>, CommonError> {
 
 #[cfg(test)]
 mod test {
-    use crate::core::{error::CommonError, io::WriteExt};
+    use crate::core::{error::Error, io::WriteExt};
 
     use super::{encode, ProtobufElement, ProtobufObject};
 
     #[test]
-    fn test() -> Result<(), CommonError> {
+    fn test() -> Result<(), Error> {
         let mut buf = Vec::with_capacity(9);
         buf.write_u32(324372432)?;
         buf.write_bytes([0x00, 0x00, 0x01, 0x9e, 0x39])?;
