@@ -161,7 +161,7 @@ impl ShortDevice {
         let wifi_ssid = format!("TP-LINK-{:x}", &uin);
         let android_id = format!(
             "OICQX.{}{}.{}{}",
-            u16::from_be_bytes(hash[..2].try_into().unwrap()),
+            u16::from_be_bytes([hash[0], hash[1]]),
             hash[2].to_string(),
             hash[3].to_string(),
             uin.to_string().chars().nth(0).unwrap(),
@@ -175,8 +175,8 @@ impl ShortDevice {
             &hex[20..]
         );
         let proc_version = format!(
-            "Linux version 4.19.71-{} (konata@takayama.github.com)",
-            u16::from_be_bytes(hash[4..6].try_into().unwrap())
+            "Linux version 4.19.71-{}",
+            u16::from_be_bytes([hash[4], hash[5]])
         );
         let mac_address = format!(
             "00:50:{:2X}:{:2X}:{:2X}:{:2X}",
@@ -184,7 +184,7 @@ impl ShortDevice {
         );
         let ip_address = format!("10.0.{}.{}", hash[10], hash[11]);
         let imei = ShortDevice::generate_imei(uin);
-        let incremental = u32::from_be_bytes(hash[12..16].try_into().unwrap());
+        let incremental = u32::from_be_bytes([hash[12], hash[13], hash[14], hash[15]]);
 
         ShortDevice {
             product: "MRS4S",
@@ -207,7 +207,7 @@ impl ShortDevice {
     fn generate_imei(uin: u32) -> String {
         let buf = uin.to_be_bytes();
 
-        let a = u16::from_be_bytes(buf[..2].try_into().unwrap());
+        let a = u16::from_be_bytes([buf[0], buf[1]]);
         let mut b = u32::from_be_bytes([0, buf[1], buf[2], buf[3]]);
 
         let uin_str = uin.to_string();

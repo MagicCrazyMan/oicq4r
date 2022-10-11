@@ -535,7 +535,7 @@ fn decode_packet(
     packet: Vec<u8>,
 ) -> Result<(), CommonError> {
     let flag = packet[4];
-    let offset = u32::from_be_bytes(packet[6..10].try_into().unwrap());
+    let offset = u32::from_be_bytes(packet[6..10].try_into()?);
     let encrypted = packet[offset as usize + 6..].to_vec();
 
     let decrypted = match flag {

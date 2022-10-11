@@ -1,7 +1,3 @@
-use std::array::TryFromSliceError;
-
-use super::jce::JceError;
-
 #[derive(Debug, Clone)]
 pub struct CommonError(String);
 
@@ -47,8 +43,8 @@ impl From<&str> for CommonError {
     }
 }
 
-impl From<JceError> for CommonError {
-    fn from(err: JceError) -> Self {
+impl From<super::jce::JceError> for CommonError {
+    fn from(err: super::jce::JceError) -> Self {
         Self(err.to_string())
     }
 }
@@ -113,8 +109,8 @@ impl From<std::time::SystemTimeError> for CommonError {
     }
 }
 
-impl From<TryFromSliceError> for CommonError {
-    fn from(err: TryFromSliceError) -> Self {
+impl From<std::array::TryFromSliceError> for CommonError {
+    fn from(err: std::array::TryFromSliceError) -> Self {
         Self(err.to_string())
     }
 }

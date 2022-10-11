@@ -1,5 +1,4 @@
 pub mod core;
-pub mod event;
 
 #[cfg(test)]
 fn init_logger() {

@@ -43,10 +43,10 @@ where
 
     let mut encrypted = Vec::<u8>::with_capacity(v.len());
 
-    let k0 = u32::from_be_bytes(key[0..4].try_into().unwrap());
-    let k1 = u32::from_be_bytes(key[4..8].try_into().unwrap());
-    let k2 = u32::from_be_bytes(key[8..12].try_into().unwrap());
-    let k3 = u32::from_be_bytes(key[12..16].try_into().unwrap());
+    let k0 = u32::from_be_bytes(key[0..4].try_into()?);
+    let k1 = u32::from_be_bytes(key[4..8].try_into()?);
+    let k2 = u32::from_be_bytes(key[8..12].try_into()?);
+    let k3 = u32::from_be_bytes(key[12..16].try_into()?);
 
     let mut r1 = 0;
     let mut r2 = 0;
@@ -110,10 +110,10 @@ where
 
     let mut decrypted = Vec::<u8>::with_capacity(encrypted.len());
 
-    let k0 = u32::from_be_bytes(key[0..4].try_into().unwrap());
-    let k1 = u32::from_be_bytes(key[4..8].try_into().unwrap());
-    let k2 = u32::from_be_bytes(key[8..12].try_into().unwrap());
-    let k3 = u32::from_be_bytes(key[12..16].try_into().unwrap());
+    let k0 = u32::from_be_bytes(key[0..4].try_into()?);
+    let k1 = u32::from_be_bytes(key[4..8].try_into()?);
+    let k2 = u32::from_be_bytes(key[8..12].try_into()?);
+    let k3 = u32::from_be_bytes(key[12..16].try_into()?);
 
     let mut r1;
     let mut r2;
@@ -145,7 +145,7 @@ where
     }
 
     if let std::cmp::Ordering::Equal =
-        BUF_7.cmp(&decrypted[decrypted.len() - 7..].try_into().unwrap())
+        BUF_7.cmp(&decrypted[decrypted.len() - 7..].try_into()?)
     {
         Ok((&decrypted[((decrypted[0] & 0x07) + 3) as usize..decrypted.len() - 7]).to_vec())
     } else {

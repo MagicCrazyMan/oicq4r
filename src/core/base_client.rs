@@ -11,7 +11,7 @@ use std::{
 };
 
 use async_recursion::async_recursion;
-use log::{error, info, Level};
+use log::{error, info};
 use tokio::{
     sync::{
         self,
@@ -21,7 +21,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{core::network::LoginCommand, define_observer};
+use crate::core::network::LoginCommand;
 
 use super::{
     device::{FullDevice, Platform, ShortDevice, APK},
@@ -152,21 +152,6 @@ impl Display for InternalErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         todo!()
     }
-}
-
-define_observer! {
-    Observer,
-    (internal_qrcode, QrcodeListener, (qrcode: &[u8; 16])),
-    (internal_slider, SliderListener, (url: &str)),
-    (internal_verify, VerifyListener, (url: &str, phone: &str)),
-    (internal_error_token, ErrorTokenListener, ()),
-    (internal_error_network, ErrorNetworkListener, (code: i64, error: &InternalErrorKind)),
-    (internal_error_login, ErrorLoginListener, (code: i64, message: &str)),
-    (internal_online, OnlineListener, (token: &[u8], nickname: &str, gender: u8, age: u8)),
-    (internal_token, TokenListener, (token: &[u8])),
-    (internal_kickoff, KickoffListener, (reason: &str)),
-    (internal_sso, SsoListener, (cmd: &str, payload: &[u8], seq: i64)),
-    (internal_verbose, VerboseListener, (verbose: &str, level: Level))
 }
 
 #[derive(Debug)]
@@ -312,7 +297,7 @@ impl BaseClient {
         data.sig.session = rand::random::<[u8; 4]>();
         data.sig.randkey = rand::random::<[u8; 16]>();
         data.ecdh = ECDH::new();
-        data.sig.d2key = token[..16].try_into().unwrap();
+        data.sig.d2key = token[..16].try_into()?;
         data.sig.d2 = token[16..token.len() - 72].to_vec();
         data.sig.tgt = token[token.len() - 72..].to_vec();
         data.sig.tgtgt = md5::compute(data.sig.d2key).0;
