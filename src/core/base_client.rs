@@ -117,7 +117,13 @@ impl SIG {
             let mut buf = Vec::with_capacity(9);
             buf.write_u32(uin).unwrap();
             buf.write_i32(0x19e39).unwrap();
-            buf
+
+            protobuf::encode(&ProtobufObject::from([
+                (1, ProtobufElement::from(1152)),
+                (2, ProtobufElement::from(9)),
+                (4, ProtobufElement::from(buf)),
+            ]))
+            .unwrap()
         };
 
         Self {
