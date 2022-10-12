@@ -176,10 +176,10 @@ fn pack_body(
             body.write_bytes(data.device.guid)?;
             body.write_u32(data.apk.subid)?;
             body.write_u32(1)?;
-            body.write_tlv(data.uin.to_be_bytes())?;
+            body.write_tlv(data.uin.to_string())?;
             body.write_u16(0)?;
 
-            let mut key = Vec::with_capacity(24);
+            let mut key = Vec::with_capacity(16 + 4 + 4);
             key.extend(md5_password);
             key.extend([0; 4]);
             key.extend(data.uin.to_be_bytes());
