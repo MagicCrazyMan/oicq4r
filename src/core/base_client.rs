@@ -77,7 +77,7 @@ impl Display for ClientError {
 
 #[derive(Debug, Clone)]
 pub struct BigData {
-    pub socketAddr: Option<SocketAddrV4>,
+    pub socket_addr: Option<SocketAddrV4>,
     pub sig_session: Vec<u8>,
     pub session_key: Vec<u8>,
 }
@@ -85,7 +85,7 @@ pub struct BigData {
 impl BigData {
     fn new() -> Self {
         Self {
-            socketAddr: None,
+            socket_addr: None,
             sig_session: vec![],
             session_key: vec![],
         }
@@ -181,21 +181,6 @@ pub enum CommandType {
     Type0 = 0,
     Type1 = 1,
     Type2 = 2,
-}
-
-#[derive(Debug, Clone)]
-pub enum InternalErrorKind {
-    Token,
-    UnknownLoginType(u8, String),
-    Qrcode(u8, String),
-}
-
-impl std::error::Error for InternalErrorKind {}
-
-impl Display for InternalErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
-    }
 }
 
 #[derive(Debug)]
@@ -421,7 +406,7 @@ impl BaseClient {
                     if let Ok((n1, n2, socket_addr)) = result {
                         data.sig.bigdata.sig_session = n1;
                         data.sig.bigdata.session_key = n2;
-                        data.sig.bigdata.socketAddr = socket_addr;
+                        data.sig.bigdata.socket_addr = socket_addr;
                     }
                 }
 
