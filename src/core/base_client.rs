@@ -11,7 +11,7 @@ use std::{
 };
 
 use async_recursion::async_recursion;
-use log::{error, info};
+use log::error;
 use tokio::{
     sync::{
         self,
@@ -116,6 +116,7 @@ impl SIG {
         let hb480 = {
             let mut buf = Vec::with_capacity(9);
             buf.write_u32(uin).unwrap();
+            buf.write_u8(0).unwrap();
             buf.write_i32(0x19e39).unwrap();
 
             protobuf::encode(&ProtobufObject::from([
@@ -355,8 +356,6 @@ impl BaseClient {
                     } else {
                         sso.body.as_slice()
                     };
-
-                    println!("{:?}", jce::decode_wrapper(&mut body));
 
                     let result = jce::decode_wrapper(&mut body)
                         .and_then(|nested| {
@@ -1132,7 +1131,7 @@ impl DataCenter {
         let len = encrypt.len() + uin.len() + 18;
         let mut payload = Vec::with_capacity(len);
         payload.write_u32(len as u32)?;
-        payload.write_u32(0x08)?;
+        payload.write_u32(0x0B)?;
         payload.write_u8(1)?;
         payload.write_u32(seq)?;
         payload.write_u8(0)?;
@@ -1596,7 +1595,7 @@ impl Heartbeater {
             .networker
             .lock()
             .await
-            .send_request(request_packet, None)
+            .send_registered_request(request_packet, None)
             .await?;
         match request.await {
             Ok(_) => {
@@ -1604,9 +1603,12 @@ impl Heartbeater {
                 self.refresh_token().await?;
                 Ok(())
             }
-            Err(_) => {
+            Err(err) => {
                 self.retried += 1;
-                error!("heartbeat timeout, retried count: {}", self.retried);
+                error!(
+                    "heartbeat timeout, retried count: {}, reason: {}",
+                    self.retried, err
+                );
 
                 if self.retried >= 2 {
                     Err(ClientError::HeartbeatFailure)?
