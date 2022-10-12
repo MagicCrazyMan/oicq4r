@@ -8,6 +8,8 @@ edition = "2021"
 [dependencies]
 async-recursion = "1.0.0"
 base64 = "0.13.0"
+chrono = "0.4.22"
+fern = { version = "0.6.1", features = ["colored", "chrono"] }
 flate2 = "1.0.24"
 hyper = { version = "0.14.20", features = ["full"] }
 hyper-tls = "0.5.0"
@@ -18,4 +20,5 @@ p256 = { version = "0.11.1", features = ["ecdh"] }
 pin-project-lite = "0.2.9"
 protobuf = "3.1.0"
 rand = "0.8.5"
+rpassword = "7.0.0"
 tokio = { version = "1.21.1", features = ["net", "macros", "rt-multi-thread"] }

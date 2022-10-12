@@ -1,12 +1,13 @@
 use std::fmt::Display;
 
-use super::{jce::JceError, tlv::TlvError, tea::TeaError, network::NetworkError, base_client::ClientError};
+use super::{jce::JceError, tlv::TlvError, tea::TeaError, network::NetworkError, base_client::ClientError, protobuf::ProtobufError};
 
 #[derive(Debug)]
 pub enum ErrorKind {
     JceError(JceError),
     TeaError(TeaError),
     TlvError(TlvError),
+    ProtobufError(ProtobufError),
     NetworkError(NetworkError),
     ClientError(ClientError),
     StdTryFromSliceError(std::array::TryFromSliceError),
@@ -16,7 +17,7 @@ pub enum ErrorKind {
     HyperHttpError(hyper::http::Error),
     TokioJoinError(tokio::task::JoinError),
     Flate2DecompressError(flate2::DecompressError),
-    ProtobufError(protobuf::Error),
+    StringifyError(String),
 }
 
 #[derive(Debug)]
@@ -40,35 +41,19 @@ impl Display for Error {
             ErrorKind::HyperHttpError(err) => err.fmt(f),
             ErrorKind::TokioJoinError(err) => err.fmt(f),
             ErrorKind::Flate2DecompressError(err) => err.fmt(f),
-            // ErrorKind::LoginError(err) => err.fmt(f),
+            ErrorKind::StringifyError(msg) => f.write_str(msg),
         }
     }
 }
 
 impl Error {
-    pub fn new(error_kind: ErrorKind) -> Self {
-        Self(error_kind)
+    pub fn new(kind: ErrorKind) -> Self {
+        Self(kind)
     }
 
     pub fn kind(&self) -> &ErrorKind {
         &self.0
     }
-
-    // pub fn illegal_data() -> Self {
-    //     Error::new("illegal data")
-    // }
-
-    // pub fn bad_token() -> Self {
-    //     Error::new("bad token")
-    // }
-
-    // pub fn not_registered() -> Self {
-    //     Error::new("not registered")
-    // }
-
-    // pub fn tag_not_existed(tag: u16) -> Self {
-    //     Error::new(format!("tag 0x{:x} not existed", tag))
-    // }
 }
 
 impl From<JceError> for Error {
@@ -86,6 +71,12 @@ impl From<TeaError> for Error {
 impl From<TlvError> for Error {
     fn from(err: TlvError) -> Self {
         Self(ErrorKind::TlvError(err))
+    }
+}
+
+impl From<ProtobufError> for Error {
+    fn from(err: ProtobufError) -> Self {
+        Self(ErrorKind::ProtobufError(err))
     }
 }
 
@@ -119,12 +110,6 @@ impl From<hyper::http::Error> for Error {
     }
 }
 
-// impl From<tokio::io::Error> for Error {
-//     fn from(err: tokio::io::Error) -> Self {
-//         Self(ErrorKind::TokioIoError(err))
-//     }
-// }
-
 impl From<tokio::task::JoinError> for Error {
     fn from(err: tokio::task::JoinError) -> Self {
         Self(ErrorKind::TokioJoinError(err))
@@ -146,11 +131,5 @@ impl From<flate2::DecompressError> for Error {
 impl From<std::string::FromUtf8Error> for Error {
     fn from(err: std::string::FromUtf8Error) -> Self {
         Self(ErrorKind::StdFromUtf8Error(err))
-    }
-}
-
-impl From<protobuf::Error> for Error {
-    fn from(err: protobuf::Error) -> Self {
-        Self(ErrorKind::ProtobufError(err))
     }
 }

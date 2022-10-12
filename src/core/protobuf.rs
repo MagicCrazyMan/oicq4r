@@ -1,16 +1,56 @@
 use std::{
     collections::HashMap,
-    io::{Read, Write}, fmt::Display,
+    fmt::Display,
+    io::{Read, Write},
 };
 
-use protobuf::{rt::WireType, CodedInputStream, CodedOutputStream};
+use protobuf::{CodedInputStream, CodedOutputStream};
 
-use super::error::Error;
+#[derive(Debug)]
+pub enum ProtobufError {
+    InvalidType(u32),
+    ItemNotFound(u32),
+    NotInteger,
+    NotDouble,
+    NotBytes,
+    NotString,
+    NotArray,
+    NotObject,
+    RawError(protobuf::Error),
+}
+
+impl std::error::Error for ProtobufError {}
+
+impl Display for ProtobufError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProtobufError::InvalidType(typee) => {
+                f.write_fmt(format_args!("invalid type: {}.", typee))
+            }
+            ProtobufError::ItemNotFound(e) => f.write_fmt(format_args!("item not found: {}.", *e)),
+            ProtobufError::RawError(e) => e.fmt(f),
+            ProtobufError::NotInteger => f.write_str("type of this protobuf element not Integer"),
+            ProtobufError::NotDouble => f.write_str("type of this protobuf element not Double"),
+            ProtobufError::NotBytes => f.write_str("type of this protobuf element not Bytes"),
+            ProtobufError::NotString => f.write_str("type of this protobuf element not String"),
+            ProtobufError::NotArray => f.write_str("type of this protobuf element not Array"),
+            ProtobufError::NotObject => {
+                f.write_str("type of this protobuf element not ProtobufObject")
+            }
+        }
+    }
+}
+
+impl From<protobuf::Error> for ProtobufError {
+    fn from(err: protobuf::Error) -> Self {
+        Self::RawError(err)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ProtobufElement {
     Null,
-    Integer(i64),
+    Integer(isize),
     Double(f64),
     Bytes(Vec<u8>),
     String(String),
@@ -18,8 +58,90 @@ pub enum ProtobufElement {
     Object(ProtobufObject),
 }
 
-impl From<i64> for ProtobufElement {
-    fn from(value: i64) -> Self {
+impl ProtobufElement {
+    pub fn try_decode_bytes(&self) -> Result<ProtobufObject, ProtobufError> {
+        if let ProtobufElement::Bytes(v) = self {
+            decode(&mut v.as_slice())
+        } else {
+            Err(ProtobufError::NotBytes)
+        }
+    }
+}
+
+impl TryFrom<ProtobufElement> for isize {
+    type Error = ProtobufError;
+
+    fn try_from(p: ProtobufElement) -> Result<Self, Self::Error> {
+        if let ProtobufElement::Integer(v) = p {
+            Ok(v)
+        } else {
+            Err(ProtobufError::NotInteger)
+        }
+    }
+}
+
+impl TryFrom<ProtobufElement> for f64 {
+    type Error = ProtobufError;
+
+    fn try_from(p: ProtobufElement) -> Result<Self, Self::Error> {
+        if let ProtobufElement::Double(v) = p {
+            Ok(v)
+        } else {
+            Err(ProtobufError::NotDouble)
+        }
+    }
+}
+
+impl TryFrom<ProtobufElement> for Vec<u8> {
+    type Error = ProtobufError;
+
+    fn try_from(p: ProtobufElement) -> Result<Self, Self::Error> {
+        if let ProtobufElement::Bytes(v) = p {
+            Ok(v)
+        } else {
+            Err(ProtobufError::NotBytes)
+        }
+    }
+}
+
+impl TryFrom<ProtobufElement> for String {
+    type Error = ProtobufError;
+
+    fn try_from(p: ProtobufElement) -> Result<Self, Self::Error> {
+        if let ProtobufElement::String(v) = p {
+            Ok(v)
+        } else {
+            Err(ProtobufError::NotString)
+        }
+    }
+}
+
+impl TryFrom<ProtobufElement> for Vec<ProtobufElement> {
+    type Error = ProtobufError;
+
+    fn try_from(p: ProtobufElement) -> Result<Self, Self::Error> {
+        if let ProtobufElement::Array(v) = p {
+            Ok(v)
+        } else {
+            Err(ProtobufError::NotString)
+        }
+    }
+}
+
+impl TryFrom<ProtobufElement> for ProtobufObject {
+    type Error = ProtobufError;
+
+    fn try_from(p: ProtobufElement) -> Result<Self, Self::Error> {
+        if let ProtobufElement::Object(v) = p {
+            Ok(v)
+        } else {
+            Err(ProtobufError::NotObject)
+        }
+    }
+}
+
+impl From<isize> for ProtobufElement {
+    fn from(value: isize) -> Self {
         Self::Integer(value)
     }
 }
@@ -83,6 +205,18 @@ impl ProtobufObject {
     pub fn with_capacity(capacity: usize) -> Self {
         Self(HashMap::with_capacity(capacity))
     }
+
+    pub fn into_inner(self) -> HashMap<u32, ProtobufElement> {
+        self.0
+    }
+
+    pub fn try_remove(&mut self, k: &u32) -> Result<ProtobufElement, ProtobufError> {
+        self.0.remove(k).ok_or(ProtobufError::ItemNotFound(*k))
+    }
+
+    pub fn try_get(&mut self, k: &u32) -> Result<&ProtobufElement, ProtobufError> {
+        self.0.get(k).ok_or(ProtobufError::ItemNotFound(*k))
+    }
 }
 
 impl<const N: usize> From<[(u32, ProtobufElement); N]> for ProtobufObject {
@@ -120,14 +254,14 @@ pub fn encode_element(
     writer: &mut CodedOutputStream,
     tag: u32,
     element: &ProtobufElement,
-) -> Result<(), Error> {
+) -> Result<(), ProtobufError> {
     match element {
         ProtobufElement::Null => {}
         ProtobufElement::Integer(value) => {
             if *value < 0 {
-                writer.write_sint64(tag, *value)?;
+                writer.write_sint64(tag, *value as i64)?;
             } else {
-                writer.write_int64(tag, *value)?;
+                writer.write_int64(tag, *value as i64)?;
             }
         }
         ProtobufElement::Double(value) => {
@@ -157,7 +291,7 @@ pub fn encode_element(
 fn encode_object(
     writer: &mut CodedOutputStream,
     object: &ProtobufObject,
-) -> Result<(), Error> {
+) -> Result<(), ProtobufError> {
     let mut list = object.iter().collect::<Vec<_>>();
     list.sort_by(|a, b| (*a.0).cmp(b.0));
 
@@ -169,13 +303,13 @@ fn encode_object(
 fn encode_object(
     writer: &mut CodedOutputStream,
     object: &ProtobufObject,
-) -> Result<(), Error> {
+) -> Result<(), ProtobufError> {
     object
         .iter()
         .try_for_each(|(tag, element)| encode_element(writer, *tag, element))
 }
 
-pub fn encode_stream<W>(writer: &mut W, object: &ProtobufObject) -> Result<(), Error>
+pub fn encode_stream<W>(writer: &mut W, object: &ProtobufObject) -> Result<(), ProtobufError>
 where
     W: Write,
 {
@@ -186,7 +320,7 @@ where
 pub fn encode_with_capacity(
     object: &ProtobufObject,
     capacity: usize,
-) -> Result<Vec<u8>, Error> {
+) -> Result<Vec<u8>, ProtobufError> {
     let mut buf = Vec::with_capacity(capacity);
     let mut coded_stream = CodedOutputStream::new(&mut buf);
     encode_object(&mut coded_stream, object)?;
@@ -195,51 +329,49 @@ pub fn encode_with_capacity(
     Ok(buf)
 }
 
-pub fn encode(object: &ProtobufObject) -> Result<Vec<u8>, Error> {
-    encode_with_capacity(object, 1000)
+pub fn encode(object: &ProtobufObject) -> Result<Vec<u8>, ProtobufError> {
+    encode_with_capacity(object, 1024)
 }
 
-// fn decode_element(&mut reader: CodedInputStream) -> Result<(), Error> {
+fn decode_object(reader: &mut CodedInputStream) -> Result<ProtobufObject, ProtobufError> {
+    let mut result = ProtobufObject::with_capacity(20);
 
-// }
+    while !reader.eof()? {
+        let k = reader.read_uint32()?;
+        let tag = k >> 3;
+        let typee = k & 0b111;
 
-// pub fn decode_stream(reader: &mut CodedInputStream) -> Result<ProtobufObject, Error> {
-//     let mut result = ProtobufObject::with_capacity(20);
+        let value = match typee {
+            0 => ProtobufElement::Integer(reader.read_int64()? as isize),
+            1 => ProtobufElement::Integer(reader.read_fixed64()? as isize),
+            2 => {
+                let buf = reader.read_bytes()?;
+                ProtobufElement::Bytes(buf)
+            }
+            5 => ProtobufElement::Integer(reader.read_fixed32()? as isize),
+            _ => return Err(ProtobufError::InvalidType(typee)),
+        };
 
-//     while !reader.eof()? {
-//         let k = reader.read_uint32()?;
-//         let tag = k >> 3;
-//         let r#type = k & 0b111;
+        if let Some(e) = result.get_mut(&tag) {
+            if let ProtobufElement::Array(list) = e {
+                list.push(value);
+            } else {
+                let e = result.remove(&tag).unwrap();
+                let value = ProtobufElement::Array(vec![e]);
+                result.insert(tag, value);
+            };
+        } else {
+            result.insert(tag, value);
+        }
+    }
 
-//         let value = match r#type {
-//             0 => ProtobufElement::I64(reader.read_int64()?),
-//             1 => ProtobufElement::Double(reader.read_double()?),
-//             2 => ProtobufElement::Double(reader.read_bytes()?),
-//             5 => ProtobufElement::Double(reader.read_fixed32()?),
-//             _ => return Err(Error::from("Invalid protobuf type")),
-//         };
+    Ok(result)
+}
 
-//         if let Some(e) = result.remove(&tag) {
-//             let v = if let ProtobufElement::Array(mut list) = e {
-//                 list.push(value);
-//                 e
-//             } else {
-//                 ProtobufElement::Array(vec![e])
-//             };
-
-//             result.insert(tag, v);
-//         } else {
-//             result.insert(tag, value);
-//         }
-//     }
-
-//     Ok(result)
-// }
-
-// pub fn decode<R: Read>(reader: &mut R) -> Result<ProtobufObject, Error> {
-//     let mut reader = CodedInputStream::new(reader);
-//     decode_stream(&mut reader)
-// }
+pub fn decode<R: Read>(reader: &mut R) -> Result<ProtobufObject, ProtobufError> {
+    let mut reader = CodedInputStream::new(reader);
+    decode_object(&mut reader)
+}
 
 #[cfg(test)]
 mod test {

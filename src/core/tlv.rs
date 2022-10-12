@@ -57,7 +57,7 @@ fn pack_body(
     emp: Option<u32>,
     md5_password: Option<[u8; 16]>,
     code: Option<Vec<u8>>,
-    ticket: Option<Vec<u8>>,
+    ticket: Option<&str>,
 ) -> Result<Vec<u8>, Error> {
     let result = match tag {
         0x01 => {
@@ -293,7 +293,10 @@ fn pack_body(
         0x187 => md5::compute(&data.device.mac_address).0.to_vec(),
         0x188 => md5::compute(&data.device.android_id).0.to_vec(),
         0x191 => 0x82u8.to_be_bytes().to_vec(),
-        0x193 => ticket.ok_or(TlvError::TicketNotProvided)?,
+        0x193 => ticket
+            .ok_or(TlvError::TicketNotProvided)?
+            .as_bytes()
+            .to_vec(),
         0x194 => data.device.imsi.to_vec(),
         0x197 | 0x198 => {
             let mut writer = Vec::with_capacity(2 + 1);
@@ -366,12 +369,18 @@ fn pack_body(
                 (1, ProtobufElement::from(device.bootloader)),
                 (2, ProtobufElement::from(device.proc_version.as_str())),
                 (3, ProtobufElement::from(device.version.codename)),
-                (4, ProtobufElement::from(device.version.incremental as i64)),
+                (
+                    4,
+                    ProtobufElement::from(device.version.incremental as isize),
+                ),
                 (5, ProtobufElement::from(device.fingerprint.as_str())),
                 (6, ProtobufElement::from(device.boot_id.as_str())),
                 (7, ProtobufElement::from(device.android_id.as_str())),
                 (8, ProtobufElement::from(device.baseband)),
-                (9, ProtobufElement::from(device.version.incremental as i64)),
+                (
+                    9,
+                    ProtobufElement::from(device.version.incremental as isize),
+                ),
             ]))?;
 
             buf
@@ -392,7 +401,7 @@ pub fn pack_with_args(
     emp: Option<u32>,
     md5_password: Option<[u8; 16]>,
     code: Option<Vec<u8>>,
-    ticket: Option<Vec<u8>>,
+    ticket: Option<&str>,
 ) -> Result<Vec<u8>, Error> {
     let mut body = pack_body(data, tag, emp, md5_password, code, ticket)?;
 

@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fmt::Display,
     io::{Cursor, Seek, SeekFrom},
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -15,13 +15,13 @@ use log::{error, info};
 use tokio::{
     sync::{
         self,
-        broadcast::{Receiver, Sender},
+        broadcast::{self, Receiver, Sender},
         Mutex, MutexGuard,
     },
     task::JoinHandle,
 };
 
-use crate::core::network::LoginCommand;
+use crate::core::{network::LoginCommand, protobuf::ProtobufElement};
 
 use super::{
     device::{FullDevice, Platform, ShortDevice, APK},
@@ -30,8 +30,8 @@ use super::{
     helper::{current_unix_timestamp_as_secs, BUF_0, BUF_16, BUF_4},
     io::{ReadExt, WriteExt},
     jce::{self, JceElement, JceError, JceObject},
-    network::{LoginRequest, Network, NetworkState, Request, Response, UniCommand, UniRequest, SSO},
-    protobuf::{self, ProtobufElement, ProtobufObject},
+    network::{LoginRequest, Network, NetworkState, Request, Response, UniRequest, SSO},
+    protobuf::{self, ProtobufObject},
     tea,
     tlv::{self, ReadTlvExt, TlvError, WriteTlvExt},
 };
@@ -42,7 +42,8 @@ pub enum LoginResult {
     Failure(String, String),
     SliderAuthorizationRequired(String),
     SecurityAuthorizationRequired(Option<String>, Option<String>),
-    PhoneSecurityCodeSent,
+    SecurityCodeSent,
+    SecurityCodeIncorrect,
     BadToken,
     QrcodeUinNotMatched(u32, u32),
     QrcodeTimeout,
@@ -74,21 +75,19 @@ impl Display for ClientError {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BigData {
-    pub ip: &'static str,
-    pub port: u16,
-    pub sig_session: [u8; 0],
-    pub session_key: [u8; 0],
+    pub socketAddr: Option<SocketAddrV4>,
+    pub sig_session: Vec<u8>,
+    pub session_key: Vec<u8>,
 }
 
 impl BigData {
     fn new() -> Self {
         Self {
-            ip: "",
-            port: 0,
-            sig_session: BUF_0,
-            session_key: BUF_0,
+            socketAddr: None,
+            sig_session: vec![],
+            session_key: vec![],
         }
     }
 }
@@ -197,7 +196,9 @@ pub struct BaseClient {
     statistics: Arc<Mutex<Statistics>>,
     data: Arc<Mutex<DataCenter>>,
     networker: Arc<Mutex<Networker>>,
-    register: Arc<Mutex<Registry>>,
+    registry: Arc<Mutex<Registry>>,
+
+    kickoff_tx: broadcast::Sender<(String, String)>,
 }
 
 impl BaseClient {
@@ -208,7 +209,7 @@ impl BaseClient {
             Arc::clone(&statistics),
             Arc::clone(&data),
         )));
-        let register = Arc::new(Mutex::new(Registry::new(
+        let registry = Arc::new(Mutex::new(Registry::new(
             Arc::clone(&data),
             Arc::clone(&networker),
         )));
@@ -216,10 +217,13 @@ impl BaseClient {
             data,
             networker,
             statistics,
-            register,
+            registry,
+
+            kickoff_tx: broadcast::channel(1).0,
         };
 
         instance.describe_network_state().await;
+        instance.describe_network_push().await;
 
         instance
     }
@@ -244,19 +248,19 @@ impl BaseClient {
         self.statistics.lock().await
     }
 
-    pub async fn on_sso(&self) -> Receiver<SSO> {
-        self.networker.lock().await.on_sso()
+    pub async fn on_kickoff(&self) -> Receiver<(String, String)> {
+        self.kickoff_tx.subscribe()
     }
 
     pub async fn on_token_update(&self) -> Receiver<Vec<u8>> {
-        self.register.lock().await.on_token_update()
+        self.registry.lock().await.on_token_update()
     }
 }
 
 impl BaseClient {
     async fn describe_network_state(&mut self) {
         let networker = Arc::clone(&self.networker);
-        let register = Arc::clone(&self.register);
+        let register = Arc::clone(&self.registry);
 
         let mut rx = self.networker.lock().await.on_state();
         tokio::spawn(async move {
@@ -265,6 +269,7 @@ impl BaseClient {
                     networker.lock().await.set_registered(false);
 
                     loop {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                         if let Err(_) = networker.lock().await.connect().await {
                             continue;
                         }
@@ -273,6 +278,149 @@ impl BaseClient {
                         }
                     }
                 };
+            }
+        });
+    }
+
+    async fn describe_network_push(&mut self) {
+        let data = Arc::clone(&self.data);
+        let networker = Arc::clone(&self.networker);
+        let register = Arc::clone(&self.registry);
+        let kickoff_tx = self.kickoff_tx.clone();
+
+        let mut rx = self.networker.lock().await.on_push();
+        tokio::spawn(async move {
+            while let Ok(sso) = rx.recv().await {
+                if sso.command == "StatSvc.ReqMSFOffline"
+                    || sso.command == "MessageSvc.PushForceOffline"
+                {
+                    if let Ok(nested) = jce::decode_wrapper(&mut sso.body.as_slice()) {
+                        if let JceElement::StructBegin(mut obj) = nested {
+                            let nest1 = obj.remove(&1);
+                            let nest2 = obj.remove(&2);
+                            let nest3 = obj.remove(&3);
+                            let nest4 = obj.remove(&4);
+
+                            let a = if let (Some(typee), Some(reason)) = (nest3, nest4) {
+                                Some((typee, reason))
+                            } else if let (Some(typee), Some(reason)) = (nest1, nest2) {
+                                Some((typee, reason))
+                            } else {
+                                None
+                            };
+
+                            if let Some((typee, reason)) = a {
+                                if let (Ok(typee), Ok(reason)) =
+                                    (String::try_from(typee), String::try_from(reason))
+                                {
+                                    let _ = kickoff_tx.send((typee, reason));
+                                    let _ = register.lock().await.unregister().await;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    error!(
+                        "push event StatSvc.ReqMSFOffline or MessageSvc.PushForceOffline error."
+                    );
+                } else if sso.command == "QualityTest.PushList"
+                    || sso.command == "OnlinePush.SidTicketExpired"
+                {
+                    if let Ok(request) =
+                        data.lock()
+                            .await
+                            .build_uni_request(sso.command, sso.body, Some(sso.seq))
+                    {
+                        if let Ok(_) = networker
+                            .lock()
+                            .await
+                            .write_registered_request(request)
+                            .await
+                        {
+                            continue;
+                        }
+                    }
+
+                    error!("push event QualityTest.PushList or OnlinePush.SidTicketExpired error.");
+                } else if sso.command == "ConfigPushSvc.PushReq" {
+                    let mut body = if sso.body[0] == 0 {
+                        &sso.body[4..]
+                    } else {
+                        sso.body.as_slice()
+                    };
+
+                    println!("{:?}", jce::decode_wrapper(&mut body));
+
+                    let result = jce::decode_wrapper(&mut body)
+                        .and_then(|nested| {
+                            if let JceElement::StructBegin(obj) = nested {
+                                Ok(obj)
+                            } else {
+                                Err(JceError::DecodeError)?
+                            }
+                        })
+                        .and_then(|mut obj| {
+                            let n1: i64 = obj.try_remove(&1)?.try_into()?;
+                            if n1 == 2 {
+                                let n2: Vec<u8> = obj.try_remove(&2)?.try_into()?;
+                                Ok(n2)
+                            } else {
+                                Err(JceError::DecodeError)?
+                            }
+                        })
+                        .and_then(|n2| jce::decode(&mut n2.as_slice()))
+                        .and_then(|mut d| {
+                            let e = d.try_remove(&5)?;
+                            if let JceElement::StructBegin(obj) = e {
+                                Ok(obj)
+                            } else {
+                                Err(JceError::DecodeError)?
+                            }
+                        })
+                        .and_then(|mut obj| {
+                            let buf: Vec<u8> = obj.try_remove(&5)?.try_into()?;
+                            let mut decoded = protobuf::decode(&mut buf.as_slice())?;
+
+                            let d1281: Vec<u8> = decoded.try_remove(&1281)?.try_into()?;
+                            let mut d1281_decoded = protobuf::decode(&mut d1281.as_slice())?;
+
+                            let n1: Vec<u8> = d1281_decoded.try_remove(&1)?.try_into()?;
+                            let n2: Vec<u8> = d1281_decoded.try_remove(&2)?.try_into()?;
+
+                            let mut socket_addr = None;
+                            let n3: Vec<ProtobufElement> =
+                                d1281_decoded.try_remove(&3)?.try_into()?;
+                            for e in n3 {
+                                let mut v: ProtobufObject = e.try_decode_bytes()?;
+
+                                let i: isize = v.try_remove(&1)?.try_into()?;
+                                if i == 10 {
+                                    let mut l: Vec<ProtobufElement> =
+                                        v.try_remove(&2)?.try_into()?;
+
+                                    let mut d: ProtobufObject = l.remove(0).try_decode_bytes()?;
+
+                                    let ip_integer: isize = d.try_remove(&2)?.try_into()?;
+                                    let ipv4 = Ipv4Addr::from(ip_integer as u32);
+                                    let port: isize = d.try_remove(&3)?.try_into()?;
+
+                                    socket_addr = Some(SocketAddrV4::new(ipv4, port as u16));
+                                }
+                            }
+
+                            Ok((n1, n2, socket_addr))
+                        });
+
+                    let mut data = data.lock().await;
+                    if let Ok((n1, n2, socket_addr)) = result {
+                        data.sig.bigdata.sig_session = n1;
+                        data.sig.bigdata.session_key = n2;
+                        data.sig.bigdata.socketAddr = socket_addr;
+                    }
+                }
+
+                error!("push event ConfigPushSvc.PushReq error.");
             }
         });
     }
@@ -471,7 +619,7 @@ impl BaseClient {
             let user = data.decode_t119(t119)?;
             drop(data);
 
-            let registered = self.register.lock().await.register().await?;
+            let registered = self.registry.lock().await.register().await?;
             if registered {
                 Ok(LoginResult::Succeeded(user))
             } else {
@@ -493,27 +641,26 @@ impl BaseClient {
             let t204 = t.remove(&0x204);
             let t174 = t.remove(&0x174);
             if t204.is_none() && t174.is_none() {
-                info!("已向密保手机发送短信验证码");
-                return Ok(LoginResult::PhoneSecurityCodeSent);
-            }
-
-            let t178 = t.remove(&0x178);
-            let phone = if let (Some(t174), Some(t178)) = (t174, t178) {
-                data.sig.t104 = t.remove(&0x104).ok_or(TlvError::TagNotExisted(0x104))?;
-                data.sig.t174 = t174;
-
-                Some(String::from_utf8(data.sig.t174.clone())?)
+                Ok(LoginResult::SecurityCodeSent)
             } else {
-                None
-            };
+                let t178 = t.remove(&0x178);
+                let phone = if let (Some(t174), Some(t178)) = (t174, t178) {
+                    data.sig.t104 = t.remove(&0x104).ok_or(TlvError::TagNotExisted(0x104))?;
+                    data.sig.t174 = t174;
 
-            let t204 = t
-                .remove(&0x204)
-                .and_then(|buf| String::from_utf8(buf).or::<String>(Ok(String::new())).ok());
+                    Some(String::from_utf8(t178)?)
+                } else {
+                    None
+                };
 
-            Ok(LoginResult::SecurityAuthorizationRequired(t204, phone))
+                let t204 = t
+                    .remove(&0x204)
+                    .and_then(|buf| String::from_utf8(buf).or::<String>(Ok(String::new())).ok());
+
+                Ok(LoginResult::SecurityAuthorizationRequired(t204, phone))
+            }
         } else if t.contains_key(&0x149) {
-            let t149 = t.remove(&0x149).unwrap();
+            let t149 = t.remove(&0x149).ok_or(TlvError::TagNotExisted(0x149))?;
             let reader = &mut &t149[2..];
 
             let len = reader.read_u16()?;
@@ -523,7 +670,7 @@ impl BaseClient {
 
             Ok(LoginResult::Failure(title, content))
         } else if t.contains_key(&0x146) {
-            let t146 = t.remove(&0x146).unwrap();
+            let t146 = t.remove(&0x146).ok_or(TlvError::TagNotExisted(0x146))?;
             let reader = &mut &t146[4..];
 
             let len = reader.read_u16()?;
@@ -581,7 +728,7 @@ impl BaseClient {
         let mut t = cursor.read_tlv()?;
 
         if retcode == 0 && t.contains_key(&0x17) {
-            let t17 = t.remove(&0x17).unwrap();
+            let t17 = t.remove(&0x17).ok_or(TlvError::TagNotExisted(0x17))?;
             self.data().await.sig.qrsig = Some(qrsig);
             Ok(t17)
         } else {
@@ -664,6 +811,102 @@ impl BaseClient {
         } else {
             Ok(None)
         }
+    }
+
+    pub async fn send_security_code(&mut self) -> Result<LoginResult, Error> {
+        let mut data = self.data().await;
+
+        let t8 = tlv::pack(&data, 0x8)?;
+        let t104 = tlv::pack(&data, 0x104)?;
+        let t116 = tlv::pack(&data, 0x116)?;
+        let t174 = tlv::pack(&data, 0x174)?;
+        let t17a = tlv::pack(&data, 0x17a)?;
+        let t197 = tlv::pack(&data, 0x197)?;
+
+        let mut body = Vec::with_capacity(
+            2 + 2 + t8.len() + t104.len() + t116.len() + t174.len() + t17a.len() + t197.len(),
+        );
+        body.write_u16(8)?;
+        body.write_u16(6)?;
+        body.write_bytes(t8)?;
+        body.write_bytes(t104)?;
+        body.write_bytes(t116)?;
+        body.write_bytes(t174)?;
+        body.write_bytes(t17a)?;
+        body.write_bytes(t197)?;
+        let request = data.build_login_request(LoginCommand::WtLoginLogin, body, None)?;
+        drop(data);
+
+        self.login(request).await
+    }
+
+    pub async fn submit_security_code<S: AsRef<str>>(
+        &mut self,
+        code: S,
+    ) -> Result<LoginResult, Error> {
+        let code = code.as_ref().trim();
+        if code.len() != 6 {
+            Ok(LoginResult::SecurityCodeIncorrect)
+        } else {
+            let mut data = self.data().await;
+
+            let t8 = tlv::pack(&data, 0x8)?;
+            let t104 = tlv::pack(&data, 0x104)?;
+            let t116 = tlv::pack(&data, 0x116)?;
+            let t174 = tlv::pack(&data, 0x174)?;
+            let t17c = tlv::pack(&data, 0x17c)?;
+            let t402 = tlv::pack(&data, 0x401)?;
+            let t198 = tlv::pack(&data, 0x198)?;
+
+            let mut body = Vec::with_capacity(
+                2 + 2
+                    + t8.len()
+                    + t104.len()
+                    + t116.len()
+                    + t174.len()
+                    + t17c.len()
+                    + t402.len()
+                    + t198.len(),
+            );
+            body.write_u16(8)?;
+            body.write_u16(6)?;
+            body.write_bytes(t8)?;
+            body.write_bytes(t104)?;
+            body.write_bytes(t116)?;
+            body.write_bytes(t174)?;
+            body.write_bytes(t17c)?;
+            body.write_bytes(t402)?;
+            body.write_bytes(t198)?;
+            let request = data.build_login_request(LoginCommand::WtLoginLogin, body, None)?;
+            drop(data);
+
+            self.login(request).await
+        }
+    }
+
+    pub async fn submit_slider<S: AsRef<str>>(&mut self, ticket: S) -> Result<LoginResult, Error> {
+        let mut data = self.data().await;
+
+        let t193 = tlv::pack_with_args(&data, 0x193, None, None, None, Some(ticket.as_ref()))?;
+        let t8 = tlv::pack(&data, 0x8)?;
+        let t104 = tlv::pack(&data, 0x104)?;
+        let t116 = tlv::pack(&data, 0x116)?;
+
+        let mut body = Vec::with_capacity(2 + 2 + t193.len() + t8.len() + t104.len() + t116.len());
+        body.write_u16(2)?;
+        body.write_u16(4)?;
+        body.write_bytes(t193)?;
+        body.write_bytes(t8)?;
+        body.write_bytes(t104)?;
+        body.write_bytes(t116)?;
+        let request = data.build_login_request(LoginCommand::WtLoginLogin, body, None)?;
+        drop(data);
+
+        self.login(request).await
+    }
+
+    pub async fn logout(&mut self) -> Result<(), Error> {
+        self.registry.lock().await.unregister().await
     }
 }
 
@@ -857,7 +1100,7 @@ impl DataCenter {
 
     fn build_uni_request<B>(
         &mut self,
-        command: UniCommand,
+        command: String,
         body: B,
         seq: Option<u32>,
     ) -> Result<UniRequest, Error>
@@ -865,13 +1108,13 @@ impl DataCenter {
         B: AsRef<[u8]>,
     {
         let seq = seq.unwrap_or(self.increase_seq());
-
         let body = body.as_ref();
-        let len = command.as_ref().len() + 20;
+
+        let len = command.len() + 20;
         let mut sso = Vec::with_capacity(len + body.len() + 4);
         sso.write_u32(len as u32)?;
-        sso.write_u32((command.as_ref().len() + 4) as u32)?;
-        sso.write_bytes(command.as_ref())?;
+        sso.write_u32((command.len() + 4) as u32)?;
+        sso.write_bytes(command.as_str())?;
         sso.write_u32(8)?;
         sso.write_bytes(self.sig.session)?;
         sso.write_u32(4)?;
@@ -902,7 +1145,7 @@ impl DataCenter {
                     (1, ProtobufElement::from(46)),
                     (
                         2,
-                        ProtobufElement::from(current_unix_timestamp_as_secs() as i64),
+                        ProtobufElement::from(current_unix_timestamp_as_secs() as isize),
                     ),
                 ])),
                 ProtobufElement::Object(ProtobufObject::from([
@@ -1037,7 +1280,7 @@ impl Networker {
         }
     }
 
-    fn on_sso(&self) -> Receiver<SSO> {
+    fn on_push(&self) -> Receiver<SSO> {
         self.network.on_sso()
     }
 
@@ -1113,27 +1356,17 @@ impl Networker {
         let response = request.await?;
 
         let rsp = jce::decode_wrapper(&mut response.as_slice())?;
-        if let JceElement::StructBegin(value) = rsp {
-            let result = value
-                .get(&9)
-                .ok_or(JceError::ItemNotFound(9))
-                .and_then(|e| {
-                    if let JceElement::Int8(e) = e {
-                        Ok(e)
-                    } else {
-                        Err(JceError::NotInt8)
-                    }
-                })
-                .and_then(|e| if *e != 0 { Ok(true) } else { Ok(false) })?;
+        if let JceElement::StructBegin(mut value) = rsp {
+            let v: i8 = value.try_remove(&9)?.try_into()?;
 
-            if !result && !refresh {
+            if v == 0 && !refresh {
                 Ok(false)
             } else {
                 self.set_registered(true);
                 Ok(true)
             }
         } else {
-            Err(JceError::NotStruct)?
+            Err(JceError::DecodeError)?
         }
     }
 
@@ -1347,11 +1580,12 @@ impl Heartbeater {
     async fn beat(&mut self) -> Result<(), Error> {
         self.networker.lock().await.sync_time_diff().await?;
 
-        let request_packet = self.data.lock().await.build_uni_request(
-            UniCommand::OidbSvc,
-            &self.data.lock().await.sig.hb480,
-            None,
-        )?;
+        let mut data = self.data.lock().await;
+        let hb480 = data.sig.hb480.clone();
+        let request_packet =
+            data.build_uni_request("OidbSvc.0x480_9_IMCore".to_string(), hb480, None)?;
+        drop(data);
+
         let request = self
             .networker
             .lock()
@@ -1380,19 +1614,92 @@ impl Heartbeater {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::Duration};
+    use std::{fs, io::stdin, time::Duration};
 
-    use log::info;
+    use log::{info, warn};
 
     use crate::{
         core::{error::Error, io::WriteExt},
         init_logger,
     };
 
-    use super::{BaseClient, ClientError, LoginResult};
+    use super::{BaseClient, LoginResult};
 
     #[tokio::test]
-    async fn test_fetch_qrcode() -> Result<(), Error> {
+    async fn test_password_login() -> Result<(), Error> {
+        init_logger();
+
+        let mut base_client = BaseClient::default(640279992).await;
+
+        base_client.connect().await?;
+
+        let password = rpassword::prompt_password("Please enter password > ")?;
+        let md5_password = md5::compute(&password).0;
+        let mut result = base_client.password_login(md5_password).await?;
+        loop {
+            if let LoginResult::Succeeded(user) = &result {
+                println!("{}", user);
+                break;
+            } else if let LoginResult::SliderAuthorizationRequired(url) = &result {
+                println!("Please finish slider authorization and get the ticket");
+                println!("{}", url);
+
+                let ticket = rpassword::prompt_password("Enter ticket to continue > ")?;
+                result = base_client.submit_slider(ticket.as_str()).await?;
+            } else if let LoginResult::SecurityAuthorizationRequired(url, _) = &result {
+                println!("Please finish security authorization using url verification or sms code");
+                println!("Enter 1(or empty) to use sms code, or enter 2 to use url > ");
+
+                let mut confirm = String::with_capacity(1);
+                loop {
+                    confirm.clear();
+                    stdin().read_line(&mut confirm)?;
+
+                    if confirm.is_empty() || confirm == "1" {
+                        if let LoginResult::SecurityCodeSent =
+                            base_client.send_security_code().await?
+                        {
+                            let mut code = String::with_capacity(6);
+                            loop {
+                                print!("Please enter code > ");
+                                stdin().read_line(&mut code)?;
+
+                                if let LoginResult::SecurityCodeIncorrect =
+                                    base_client.submit_security_code(code.as_str()).await?
+                                {
+                                    println!("SMS code incorrect! please retry.");
+                                } else {
+                                    break;
+                                }
+                            }
+                        } else {
+                            panic!("SMS code sent failure, please retry later.")
+                        }
+                    } else if confirm == "2" {
+                        println!("{:?}", url);
+                        print!("Enter to continue when finished > ");
+                    }
+                }
+            } else if let LoginResult::Failure(typee, reason) = &result {
+                panic!("[{}] {}", typee, reason);
+            } else {
+                panic!("{:?}", result);
+            }
+        }
+
+        if let Ok((typee, reason)) = base_client.on_kickoff().await.recv().await {
+            warn!("Kickoff: {}, {}", typee, reason);
+        } else {
+            panic!("kick off failure.")
+        }
+
+        base_client.disconnect().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_qrcode_login() -> Result<(), Error> {
         init_logger();
 
         let mut base_client = BaseClient::default(640279992).await;
@@ -1423,8 +1730,13 @@ mod tests {
             }
         }
 
+        if let Ok((typee, reason)) = base_client.on_kickoff().await.recv().await {
+            warn!("Kickoff: {}, {}", typee, reason);
+        } else {
+            panic!("kick off failure.")
+        }
+
         base_client.disconnect().await?;
-        drop(base_client);
 
         Ok(())
     }

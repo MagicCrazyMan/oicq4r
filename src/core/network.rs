@@ -2,7 +2,6 @@ use flate2::Decompress;
 use hyper::{body::to_bytes, Body, Client};
 use hyper_tls::HttpsConnector;
 use log::{debug, error, info, warn};
-use pin_project_lite::pin_project;
 use std::{
     borrow::BorrowMut,
     collections::HashMap,
@@ -140,27 +139,27 @@ impl Request for LoginRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UniCommand {
-    OidbSvc,
-}
+// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// pub enum UniCommand {
+//     OidbSvc,
+// }
 
-impl AsRef<str> for UniCommand {
-    fn as_ref(&self) -> &str {
-        match self {
-            UniCommand::OidbSvc => "OidbSvc.0x480_9_IMCore",
-        }
-    }
-}
+// impl AsRef<str> for UniCommand {
+//     fn as_ref(&self) -> &str {
+//         match self {
+//             UniCommand::OidbSvc => "OidbSvc.0x480_9_IMCore",
+//         }
+//     }
+// }
 
 pub struct UniRequest {
     seq: u32,
-    command: UniCommand,
+    command: String,
     payload: Vec<u8>,
 }
 
 impl UniRequest {
-    pub fn new(seq: u32, command: UniCommand, payload: Vec<u8>) -> Self {
+    pub fn new(seq: u32, command: String, payload: Vec<u8>) -> Self {
         Self {
             seq,
             command,
@@ -205,14 +204,12 @@ impl Polling {
     }
 }
 
-pin_project! {
-    #[derive(Debug)]
-    #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub struct Response {
-        timeout: Duration,
-        start: Instant,
-        polling: Arc<Mutex<Polling>>,
-    }
+#[derive(Debug)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct Response {
+    timeout: Duration,
+    start: Instant,
+    polling: Arc<Mutex<Polling>>,
 }
 
 impl Future for Response {
@@ -269,7 +266,7 @@ pub struct Network {
     auto_search: bool,
 
     state_tx: broadcast::Sender<(NetworkState, Option<SocketAddr>)>,
-    sso_tx: broadcast::Sender<SSO>,
+    push_tx: broadcast::Sender<SSO>,
 }
 
 impl Network {
@@ -289,12 +286,12 @@ impl Network {
             auto_search: true,
 
             state_tx: broadcast::channel(1).0,
-            sso_tx: broadcast::channel(1).0,
+            push_tx: broadcast::channel(1).0,
         }
     }
 
     pub fn on_sso(&self) -> broadcast::Receiver<SSO> {
-        self.sso_tx.subscribe()
+        self.push_tx.subscribe()
     }
 
     pub fn on_state(&self) -> broadcast::Receiver<(NetworkState, Option<SocketAddr>)> {
@@ -448,7 +445,7 @@ impl Network {
         let polling_requests = Arc::clone(&self.polling_requests);
         let close_manually = Arc::clone(&self.close_manually);
         let state_tx = self.state_tx.clone();
-        let sso_tx = self.sso_tx.clone();
+        let sso_tx = self.push_tx.clone();
 
         std::thread::spawn(move || {
             // 断开 tcp 之后 peer_addr 会返回 None，因此需要提前拿出来
@@ -682,6 +679,7 @@ fn parse_sso(buf: &[u8]) -> Result<SSO, Error> {
         Ok(SSO { seq, command, body })
     }
 }
+
 // #[cfg(test)]
 // mod test {
 //     use std::{sync::Arc, time::Duration};
