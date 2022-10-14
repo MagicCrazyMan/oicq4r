@@ -128,7 +128,7 @@ where
                         ProtobufElement::from(client.data().await.uin.to_string()),
                     ),
                     (3, ProtobufElement::from("PicUp.DataUp")),
-                    (4, ProtobufElement::from(seq + 1)),
+                    (4, ProtobufElement::from(seq)),
                     (6, ProtobufElement::from(client.data().await.apk.subid)),
                     (7, ProtobufElement::from(4096)),
                     (8, ProtobufElement::from(params.command_id() as u8)),
@@ -163,16 +163,17 @@ where
         buf.write_u32(head.len() as u32)?;
         buf.write_u32(chunk.len() as u32)?;
 
-        result.write_bytes(&buf);
-        result.write_bytes(head);
-        result.write_bytes(chunk);
-        result.write_bytes(&buf);
+        result.write_bytes(&buf)?;
+        result.write_bytes(head)?;
+        result.write_bytes(chunk)?;
+        result.write_u8(41)?;
     }
 
     Ok(result)
 }
 
 pin_project! {
+    #[derive(Debug)]
     pub struct UploadProgress {
         stream: TcpStream,
         body: Vec<u8>,
