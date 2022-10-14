@@ -4,10 +4,11 @@ use std::{
     io::{Read, Write},
 };
 
+use crate::error::Error;
+
 use super::{
     base_client::DataCenter,
     device::Platform,
-    error::Error,
     helper::{current_unix_timestamp_as_millis, BUF_0, BUF_1, BUF_4},
     io::WriteExt,
     protobuf::{encode, ProtobufElement, ProtobufObject},
@@ -369,18 +370,12 @@ fn pack_body(
                 (1, ProtobufElement::from(device.bootloader)),
                 (2, ProtobufElement::from(device.proc_version.as_str())),
                 (3, ProtobufElement::from(device.version.codename)),
-                (
-                    4,
-                    ProtobufElement::from(device.version.incremental as isize),
-                ),
+                (4, ProtobufElement::from(device.version.incremental)),
                 (5, ProtobufElement::from(device.fingerprint.as_str())),
                 (6, ProtobufElement::from(device.boot_id.as_str())),
                 (7, ProtobufElement::from(device.android_id.as_str())),
                 (8, ProtobufElement::from(device.baseband)),
-                (
-                    9,
-                    ProtobufElement::from(device.version.incremental as isize),
-                ),
+                (9, ProtobufElement::from(device.version.incremental)),
             ]))?;
 
             buf

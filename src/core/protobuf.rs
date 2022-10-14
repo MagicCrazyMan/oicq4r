@@ -146,6 +146,60 @@ impl From<isize> for ProtobufElement {
     }
 }
 
+impl From<i64> for ProtobufElement {
+    fn from(value: i64) -> Self {
+        Self::Integer(value as isize)
+    }
+}
+
+impl From<u64> for ProtobufElement {
+    fn from(value: u64) -> Self {
+        Self::Integer(value as isize)
+    }
+}
+
+impl From<i32> for ProtobufElement {
+    fn from(value: i32) -> Self {
+        Self::Integer(value as isize)
+    }
+}
+
+impl From<u32> for ProtobufElement {
+    fn from(value: u32) -> Self {
+        Self::Integer(value as isize)
+    }
+}
+
+impl From<i16> for ProtobufElement {
+    fn from(value: i16) -> Self {
+        Self::Integer(value as isize)
+    }
+}
+
+impl From<u16> for ProtobufElement {
+    fn from(value: u16) -> Self {
+        Self::Integer(value as isize)
+    }
+}
+
+impl From<i8> for ProtobufElement {
+    fn from(value: i8) -> Self {
+        Self::Integer(value as isize)
+    }
+}
+
+impl From<u8> for ProtobufElement {
+    fn from(value: u8) -> Self {
+        Self::Integer(value as isize)
+    }
+}
+
+impl From<f32> for ProtobufElement {
+    fn from(value: f32) -> Self {
+        Self::Double(value as f64)
+    }
+}
+
 impl From<f64> for ProtobufElement {
     fn from(value: f64) -> Self {
         Self::Double(value)
@@ -172,6 +226,12 @@ impl From<Vec<u8>> for ProtobufElement {
 
 impl<const N: usize> From<[u8; N]> for ProtobufElement {
     fn from(value: [u8; N]) -> Self {
+        Self::Bytes(value.to_vec())
+    }
+}
+
+impl From<&[u8]> for ProtobufElement {
+    fn from(value: &[u8]) -> Self {
         Self::Bytes(value.to_vec())
     }
 }
@@ -216,6 +276,12 @@ impl ProtobufObject {
 
     pub fn try_get(&mut self, k: &u32) -> Result<&ProtobufElement, ProtobufError> {
         self.0.get(k).ok_or(ProtobufError::ItemNotFound(*k))
+    }
+}
+
+impl From<Vec<(u32, ProtobufElement)>> for ProtobufObject {
+    fn from(arr: Vec<(u32, ProtobufElement)>) -> Self {
+        Self(arr.into_iter().collect::<HashMap<_, _>>())
     }
 }
 
@@ -375,7 +441,7 @@ pub fn decode<R: Read>(reader: &mut R) -> Result<ProtobufObject, ProtobufError> 
 
 #[cfg(test)]
 mod test {
-    use crate::core::{error::Error, io::WriteExt};
+    use crate::{core::io::WriteExt, error::Error};
 
     use super::{encode, ProtobufElement, ProtobufObject};
 

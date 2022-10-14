@@ -8,4 +8,3 @@ pub mod tlv;
 pub mod device;
 pub mod io;
 pub mod protobuf;
-pub mod error;

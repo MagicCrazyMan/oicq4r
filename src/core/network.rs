@@ -1,13 +1,11 @@
 use flate2::Decompress;
-use hyper::{body::to_bytes, Body, Client};
-use hyper_tls::HttpsConnector;
 use log::{debug, error, info, warn};
 use std::{
     borrow::BorrowMut,
     collections::HashMap,
     fmt::Display,
     future::Future,
-    io::{Cursor, Read, Seek, SeekFrom, Write},
+    io::{BufReader, Cursor, Read, Seek, SeekFrom, Write},
     net::{Shutdown, SocketAddr, TcpStream},
     pin::Pin,
     sync::{Arc, Weak},
@@ -19,11 +17,10 @@ use tokio::sync::{
     Mutex, MutexGuard,
 };
 
-use crate::core::helper::BUF_16;
+use crate::{core::helper::BUF_16, error::Error};
 
 use super::{
     base_client::{DataCenter, Statistics},
-    error::Error,
     io::ReadExt,
     jce::{decode_wrapper, encode_wrapper, JceElement},
     tea::{decrypt, encrypt},
@@ -438,7 +435,7 @@ impl Network {
         Ok(target_server)
     }
 
-    fn describe_packets_receiving(&mut self, mut reader: TcpStream) -> std::thread::JoinHandle<()> {
+    fn describe_packets_receiving(&mut self, reader: TcpStream) -> std::thread::JoinHandle<()> {
         let data = Arc::clone(&self.data);
         let statistics = Arc::clone(&self.statistics);
         let state = Arc::clone(&self.state);
@@ -450,6 +447,7 @@ impl Network {
         std::thread::spawn(move || {
             // 断开 tcp 之后 peer_addr 会返回 None，因此需要提前拿出来
             let remote_addr = reader.peer_addr().ok();
+            let mut reader = BufReader::new(reader);
 
             let mut e = None;
             let mut buf = [0; 2048];
@@ -534,18 +532,15 @@ async fn update_server_list() -> Result<Vec<(String, u16)>, Error> {
 
     let encrypted_payload = encrypt(request_payload, &UPDATE_SERVER_KEY)?;
 
-    let client = Client::builder().build::<_, hyper::Body>(HttpsConnector::new());
+    let client = reqwest::Client::new();
     let response = client
-        .request(
-            hyper::Request::builder()
-                .method("POST")
-                .uri("https://configsvr.msf.3g.qq.com/configsvr/serverlist.jsp?mType=getssolist")
-                .body(Body::from(encrypted_payload))?,
-        )
+        .post("https://configsvr.msf.3g.qq.com/configsvr/serverlist.jsp?mType=getssolist")
+        .body(encrypted_payload)
+        .send()
         .await?;
-    let response_body: Vec<u8> = to_bytes(response).await?.into();
+    let response_body = response.bytes().await?;
 
-    let decrypted = decrypt(&response_body, &UPDATE_SERVER_KEY)?;
+    let decrypted = decrypt(response_body, &UPDATE_SERVER_KEY)?;
     let nested = decode_wrapper(&mut &decrypted[4..])?;
 
     if let JceElement::StructBegin(mut value) = nested {

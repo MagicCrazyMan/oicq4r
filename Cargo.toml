@@ -7,12 +7,13 @@ edition = "2021"
 
 [dependencies]
 async-recursion = "1.0.0"
+async-trait = "0.1.57"
 base64 = "0.13.0"
+bytes = "1.2.1"
 chrono = "0.4.22"
 fern = { version = "0.6.1", features = ["colored", "chrono"] }
 flate2 = "1.0.24"
-hyper = { version = "0.14.20", features = ["full"] }
-hyper-tls = "0.5.0"
+image = "0.24.4"
 log = "0.4.17"
 log4rs = "1.1.1"
 md5 = "0.7.0"
@@ -20,5 +21,9 @@ p256 = { version = "0.11.1", features = ["ecdh"] }
 pin-project-lite = "0.2.9"
 protobuf = "3.1.0"
 rand = "0.8.5"
+reqwest = "0.11.12"
 rpassword = "7.0.0"
-tokio = { version = "1.21.1", features = ["net", "macros", "rt-multi-thread"] }
+serde = "1.0.145"
+serde_json = "1.0.86"
+tokio = { version = "1.21.1", features = ["net", "macros", "rt-multi-thread", "fs"] }
+uuid = { version = "1.2.1", features = ["v4"] }

@@ -3,7 +3,9 @@ use std::{
     io::{Read, Write},
 };
 
-use super::{error::Error, helper::BUF_7};
+use crate::error::Error;
+
+use super::helper::BUF_7;
 
 #[derive(Debug)]
 pub enum TeaError {

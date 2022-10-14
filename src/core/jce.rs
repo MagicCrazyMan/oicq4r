@@ -5,10 +5,9 @@ use std::{
     io::{Read, Write},
 };
 
-use super::{
-    error::{Error, ErrorKind},
-    io::WriteExt,
-};
+use crate::error::{Error, ErrorKind};
+
+use super::io::WriteExt;
 
 #[derive(Debug)]
 pub enum JceError {
@@ -868,10 +867,7 @@ mod test {
             ProtobufElement::from([
                 ProtobufElement::Object(ProtobufObject::from([
                     (1, ProtobufElement::from(46)),
-                    (
-                        2,
-                        ProtobufElement::from(current_unix_timestamp_as_secs() as isize),
-                    ),
+                    (2, ProtobufElement::from(current_unix_timestamp_as_secs())),
                 ])),
                 ProtobufElement::Object(ProtobufObject::from([
                     (1, ProtobufElement::from(283)),

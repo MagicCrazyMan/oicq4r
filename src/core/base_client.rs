@@ -21,12 +21,14 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::core::{network::LoginCommand, protobuf::ProtobufElement};
+use crate::{
+    core::{network::LoginCommand, protobuf::ProtobufElement},
+    error::Error,
+};
 
 use super::{
     device::{FullDevice, Platform, ShortDevice, APK},
     ecdh::ECDH,
-    error::Error,
     helper::{current_unix_timestamp_as_secs, BUF_0, BUF_16, BUF_4},
     io::{ReadExt, WriteExt},
     jce::{self, JceElement, JceError, JceObject},
@@ -79,7 +81,7 @@ impl Display for ClientError {
 pub struct BigData {
     pub socket_addr: Option<SocketAddrV4>,
     pub sig_session: Vec<u8>,
-    pub session_key: Vec<u8>,
+    pub session_key: [u8; 16],
 }
 
 impl BigData {
@@ -87,7 +89,7 @@ impl BigData {
         Self {
             socket_addr: None,
             sig_session: vec![],
-            session_key: vec![],
+            session_key: [0; 16],
         }
     }
 }
@@ -240,6 +242,18 @@ impl BaseClient {
         self.statistics.lock().await
     }
 
+    pub async fn send_registered_request(
+        &self,
+        request: UniRequest,
+        timeout: Option<Duration>,
+    ) -> Result<Response, Error> {
+        self.networker
+            .lock()
+            .await
+            .send_registered_request(request, timeout)
+            .await
+    }
+
     pub async fn on_kickoff(&self) -> Receiver<(String, String)> {
         self.kickoff_tx.subscribe()
     }
@@ -377,6 +391,7 @@ impl BaseClient {
 
                             let n1: Vec<u8> = d1281_decoded.try_remove(&1)?.try_into()?;
                             let n2: Vec<u8> = d1281_decoded.try_remove(&2)?.try_into()?;
+                            let n2: [u8; 16] = n2[..16].try_into()?;
 
                             let mut socket_addr = None;
                             let n3: Vec<ProtobufElement> =
@@ -1088,15 +1103,17 @@ impl DataCenter {
         Ok(request)
     }
 
-    fn build_uni_request<B>(
+    pub fn build_uni_request<S, B>(
         &mut self,
-        command: String,
+        command: S,
         body: B,
         seq: Option<u32>,
     ) -> Result<UniRequest, Error>
     where
         B: AsRef<[u8]>,
+        S: AsRef<str>,
     {
+        let command = command.as_ref();
         let seq = seq.unwrap_or(self.increase_seq());
         let body = body.as_ref();
 
@@ -1104,7 +1121,7 @@ impl DataCenter {
         let mut sso = Vec::with_capacity(len + body.len() + 4);
         sso.write_u32(len as u32)?;
         sso.write_u32((command.len() + 4) as u32)?;
-        sso.write_bytes(command.as_str())?;
+        sso.write_bytes(command)?;
         sso.write_u32(8)?;
         sso.write_bytes(self.sig.session)?;
         sso.write_u32(4)?;
@@ -1124,7 +1141,7 @@ impl DataCenter {
         payload.write_bytes(uin)?;
         payload.write_bytes(encrypt)?;
 
-        Ok(UniRequest::new(seq, command, payload))
+        Ok(UniRequest::new(seq, command.to_string(), payload))
     }
 
     fn build_register_request(&mut self, logout: bool) -> Result<LoginRequest, Error> {
@@ -1133,10 +1150,7 @@ impl DataCenter {
             ProtobufElement::from([
                 ProtobufElement::Object(ProtobufObject::from([
                     (1, ProtobufElement::from(46)),
-                    (
-                        2,
-                        ProtobufElement::from(current_unix_timestamp_as_secs() as isize),
-                    ),
+                    (2, ProtobufElement::from(current_unix_timestamp_as_secs())),
                 ])),
                 ProtobufElement::Object(ProtobufObject::from([
                     (1, ProtobufElement::from(283)),
@@ -1572,8 +1586,7 @@ impl Heartbeater {
 
         let mut data = self.data.lock().await;
         let hb480 = data.sig.hb480.clone();
-        let request_packet =
-            data.build_uni_request("OidbSvc.0x480_9_IMCore".to_string(), hb480, None)?;
+        let request_packet = data.build_uni_request("OidbSvc.0x480_9_IMCore", hb480, None)?;
         drop(data);
 
         let request = self
@@ -1611,16 +1624,13 @@ mod tests {
 
     use log::{info, warn};
 
-    use crate::{
-        core::{error::Error, io::WriteExt},
-        init_logger,
-    };
+    use crate::{core::io::WriteExt, error::Error, init_logger, tmp_dir};
 
     use super::{BaseClient, LoginResult};
 
     #[tokio::test]
     async fn test_password_login() -> Result<(), Error> {
-        init_logger();
+        init_logger()?;
 
         let mut base_client = BaseClient::default(640279992).await;
 
@@ -1693,17 +1703,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_qrcode_login() -> Result<(), Error> {
-        init_logger();
+        init_logger()?;
 
         let mut base_client = BaseClient::default(640279992).await;
 
         base_client.connect().await?;
         let qrcode = base_client.fetch_qrcode().await?;
+
         let mut file = fs::OpenOptions::new()
             .append(false)
             .create(true)
             .write(true)
-            .open("./qrcode.jpeg")
+            .open(tmp_dir()?.join("qrcode.jpg"))
             .unwrap();
         let _ = file.write_bytes(&qrcode);
         info!("Qrcode downloaded");
@@ -1736,7 +1747,7 @@ mod tests {
 
     #[tokio::test]
     async fn test() -> Result<(), Error> {
-        init_logger();
+        init_logger()?;
 
         let base_client = BaseClient::default(1313).await;
 
