@@ -58,16 +58,6 @@ pub enum ProtobufElement {
     Object(ProtobufObject),
 }
 
-impl ProtobufElement {
-    pub fn try_decode_bytes(&self) -> Result<ProtobufObject, ProtobufError> {
-        if let ProtobufElement::Bytes(v) = self {
-            decode(&mut v.as_slice())
-        } else {
-            Err(ProtobufError::NotBytes)
-        }
-    }
-}
-
 impl TryFrom<ProtobufElement> for isize {
     type Error = ProtobufError;
 
@@ -134,6 +124,8 @@ impl TryFrom<ProtobufElement> for ProtobufObject {
     fn try_from(p: ProtobufElement) -> Result<Self, Self::Error> {
         if let ProtobufElement::Object(v) = p {
             Ok(v)
+        } else if let ProtobufElement::Bytes(v) = p {
+            decode(&mut v.as_slice())
         } else {
             Err(ProtobufError::NotObject)
         }

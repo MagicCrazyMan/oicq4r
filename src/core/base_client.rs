@@ -397,14 +397,14 @@ impl BaseClient {
                             let n3: Vec<ProtobufElement> =
                                 d1281_decoded.try_remove(&3)?.try_into()?;
                             for e in n3 {
-                                let mut v: ProtobufObject = e.try_decode_bytes()?;
+                                let mut v: ProtobufObject = e.try_into()?;
 
                                 let i: isize = v.try_remove(&1)?.try_into()?;
                                 if i == 10 {
                                     let mut l: Vec<ProtobufElement> =
                                         v.try_remove(&2)?.try_into()?;
 
-                                    let mut d: ProtobufObject = l.remove(0).try_decode_bytes()?;
+                                    let mut d: ProtobufObject = l.remove(0).try_into()?;
 
                                     let ip_integer: isize = d.try_remove(&2)?.try_into()?;
                                     let ipv4 = Ipv4Addr::from(ip_integer as u32);

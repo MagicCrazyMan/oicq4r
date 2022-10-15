@@ -10,8 +10,11 @@ use std::{
 
 use pin_project_lite::pin_project;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
-    net::{TcpSocket, TcpStream},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpSocket, TcpStream,
+    },
     sync::broadcast,
     time::Instant,
 };
@@ -31,6 +34,7 @@ pub enum HighwayError {
     ExtNotProvided,
     UploadChannelNotExisted,
     UploadTimeout,
+    UploadError(isize),
 }
 
 impl Display for HighwayError {
@@ -42,6 +46,9 @@ impl Display for HighwayError {
             }
             HighwayError::TicketNotProvided => f.write_str("ticket not provided."),
             HighwayError::ExtNotProvided => f.write_str("ext not provided."),
+            HighwayError::UploadError(code) => {
+                f.write_fmt(format_args!("upload failure (code: {})", code))
+            }
         }
     }
 }
@@ -218,6 +225,92 @@ impl<R: AsyncRead + Unpin> Future for Transformer<R> {
 
 pin_project! {
     #[derive(Debug)]
+    pub struct UploadResponder<S> {
+        stream: S,
+        error_code: isize,
+        finished: bool,
+
+        buf: [u8; 1024],
+        ready_buf: Vec<u8>,
+
+        progress_tx: broadcast::Sender<f64>,
+        #[pin]
+        _pin: PhantomPinned
+    }
+}
+
+impl<S: AsyncRead + Unpin> UploadResponder<S> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream,
+            error_code: 0,
+            finished: false,
+            buf: [0; 1024],
+            ready_buf: Vec::with_capacity(5120),
+            progress_tx: broadcast::channel(1).0,
+            _pin: PhantomPinned,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> Future for UploadResponder<S> {
+    type Output = Result<(), Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.project();
+
+        if *me.finished {
+            Poll::Ready(Ok(()))
+        } else if *me.error_code != 0 {
+            Poll::Ready(Err(HighwayError::UploadError(*me.error_code))?)
+        } else {
+            let mut buf = ReadBuf::new(me.buf);
+            ready!(Pin::new(me.stream).poll_read(cx, &mut buf))?;
+
+            let ready_buf = me.ready_buf;
+            ready_buf.extend(buf.filled().iter());
+
+            while ready_buf.len() >= 5 {
+                let len = i32::from_be_bytes(ready_buf[1..5].try_into()?) as usize;
+
+                if ready_buf.len() >= len + 10 {
+                    let header = &mut &ready_buf[9..len + 9];
+                    let mut rsp = protobuf::decode(header)?;
+
+                    *me.error_code = rsp.try_remove(&3)?.try_into()?;
+                    if *me.error_code != 0 {
+                        // 上传出错
+                        break;
+                    } else {
+                        let mut r2: ProtobufObject = rsp.try_remove(&2)?.try_into()?;
+
+                        let r22: isize = r2.try_remove(&2)?.try_into()?;
+                        let r23: isize = r2.try_remove(&3)?.try_into()?;
+                        let r24: isize = r2.try_remove(&4)?.try_into()?;
+
+                        let percent = (r23 as f64 + r24 as f64) / r22 as f64 * 100.0;
+                        let _ = me.progress_tx.send(percent);
+
+                        if percent >= 100.0 {
+                            *me.finished = true;
+                            break;
+                        }
+                    }
+
+                    let _ = ready_buf.splice(..10 + len, []);
+                } else {
+                    break;
+                }
+            }
+
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+pin_project! {
+    #[derive(Debug)]
     pub struct UploadProgress<S, R> {
         stream: S,
         transformer: Transformer<R>,
@@ -227,40 +320,35 @@ pin_project! {
         // 本次编码已将上传的长度
         uploaded: usize,
 
-        received: [u8; 1024],
-        wait_response: bool,
-
         timeout: Option<Duration>,
         start: Instant,
 
-        progress_tx: broadcast::Sender<(usize, usize)>,
         #[pin]
         _pin: PhantomPinned
     }
 }
 
-impl<S: AsyncWrite + AsyncRead + Unpin, R: AsyncRead + Unpin> UploadProgress<S, R> {
-    fn new(stream: S, transformer: Transformer<R>, timeout: Option<Duration>) -> Self {
-        Self {
+impl<S: AsyncWrite + Unpin, R: AsyncRead + Unpin> UploadProgress<S, R> {
+    async fn new<P: HighwayUploadParameters>(
+        stream: S,
+        client: &Client,
+        params: &P,
+        source: R,
+    ) -> Result<Self, Error> {
+        let transformer = Transformer::new(client, params, source).await?;
+        Ok(Self {
             stream,
             transformer,
             queue: vec![],
             uploaded: 0,
-            received: [0; 1024],
-            wait_response: false,
-            timeout,
+            timeout: params.timeout(),
             start: Instant::now(),
-            progress_tx: broadcast::channel(1).0,
             _pin: PhantomPinned,
-        }
-    }
-
-    pub fn on_progress(&self) -> broadcast::Receiver<(usize, usize)> {
-        self.progress_tx.subscribe()
+        })
     }
 }
 
-impl<S: AsyncWrite + AsyncRead + Unpin, R: AsyncRead + Unpin> Future for UploadProgress<S, R> {
+impl<S: AsyncWrite + Unpin, R: AsyncRead + Unpin> Future for UploadProgress<S, R> {
     type Output = Result<(), Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -276,7 +364,6 @@ impl<S: AsyncWrite + AsyncRead + Unpin, R: AsyncRead + Unpin> Future for UploadP
 
         // 已经全部上传完，且所有数据已经编码完毕，完成本次上传任务
         if me.queue.len() == 0 && me.transformer.ended() {
-            ready!(Pin::new(me.stream).poll_shutdown(cx))?;
             Poll::Ready(Ok(()))
         }
         // 检查当前已编码的数据是否已经上传完成，
@@ -302,13 +389,7 @@ impl<S: AsyncWrite + AsyncRead + Unpin, R: AsyncRead + Unpin> Future for UploadP
             *me.uploaded += n;
             if me.queue.len() == *me.uploaded {
                 me.queue.clear();
-                *me.wait_response = true;
                 *me.uploaded = 0;
-
-                let _ = me.progress_tx.send((
-                    me.transformer.total as usize,
-                    me.transformer.transformed as usize,
-                ));
             }
 
             cx.waker().wake_by_ref();
@@ -317,12 +398,49 @@ impl<S: AsyncWrite + AsyncRead + Unpin, R: AsyncRead + Unpin> Future for UploadP
     }
 }
 
+pin_project! {
+    #[derive(Debug)]
+    pub struct Uploader<R> {
+        responder: UploadResponder<OwnedReadHalf>,
+        progress: UploadProgress<OwnedWriteHalf, R>,
+        #[pin]
+        _pin: PhantomPinned
+    }
+}
+
+impl<R: AsyncRead + Unpin> Uploader<R> {
+    async fn new<P: HighwayUploadParameters>(
+        client: &Client,
+        stream: TcpStream,
+        params: &P,
+        source: R,
+    ) -> Result<Self, Error> {
+        let (read, write) = stream.into_split();
+        Ok(Self {
+            responder: UploadResponder::new(read),
+            progress: UploadProgress::new(write, client, params, source).await?,
+            _pin: PhantomPinned,
+        })
+    }
+
+    pub fn on_progress(&self) -> broadcast::Receiver<f64> {
+        self.responder.progress_tx.subscribe()
+    }
+
+    pub async fn send(self) -> Result<(), Error> {
+        let (a, b) = tokio::join!(self.responder, self.progress,);
+
+        a.and(b)
+
+    }
+}
+
 pub async fn highway_upload<R, P>(
     client: &Client,
     source: R,
     params: P,
     socket_addr: Option<SocketAddrV4>,
-) -> Result<UploadProgress<TcpStream, R>, Error>
+) -> Result<Uploader<R>, Error>
 where
     R: AsyncRead + Unpin,
     P: HighwayUploadParameters,
@@ -331,9 +449,8 @@ where
 
     if let Some(socket_addr) = socket_addr {
         let tcp_stream = TcpSocket::new_v4()?.connect(socket_addr.into()).await?;
-        let transformer = Transformer::new(client, &params, source).await?;
-        let uploader_progress = UploadProgress::new(tcp_stream, transformer, params.timeout());
-        Ok(uploader_progress)
+        let uploader = Uploader::new(client, tcp_stream, &params, source).await?;
+        Ok(uploader)
     } else {
         Err(Error::from(HighwayError::UploadChannelNotExisted))
     }
@@ -341,7 +458,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
+    use std::io::Read;
 
     use super::*;
     use crate::{client::Client, init_logger, tmp_dir};
@@ -374,40 +491,23 @@ mod tests {
     async fn test_upload() -> Result<(), Error> {
         init_logger()?;
 
-        let pic_path = tmp_dir()?.join("qrcode.jpg");
-        let mut file = std::fs::File::open(pic_path)?;
+        let mut file = std::fs::File::open(tmp_dir()?.join("qrcode.jpg"))?;
         let mut buf = Vec::with_capacity(2048);
         file.read_to_end(&mut buf)?;
+        let mut sliced = buf.as_slice();
 
         let client = Client::default(640279992).await;
 
-        let params = Params(buf.clone());
-        let mut aaa = buf.as_slice();
-        let transformer = Transformer::new(&client, &params, &mut aaa).await?;
+        let tcp = TcpStream::connect("localhost:1111").await?;
+        let uploader = Uploader::new(&client, tcp, &Params(buf.clone()), &mut sliced).await?;
 
-        // let mut receiver = Vec::with_capacity(5120);
-        // let uploader_progress = UploadProgress::new(&mut receiver, transformer, params.timeout());
-
-        // let mut rx = uploader_progress.on_progress();
-        // tokio::spawn(async move {
-        //     while let Ok((total, uploaded)) = rx.recv().await {
-        //         println!(
-        //             "total: {total}, uploaded: {uploaded}, percent: {:.4}%",
-        //             uploaded
-        //                 .ne(&0)
-        //                 .then_some(uploaded as f64 / total as f64 * 100.0)
-        //                 .unwrap_or(0.0)
-        //         );
-        //     }
-        // });
-        // uploader_progress.await?;
-
-        // let mut f = std::fs::OpenOptions::new()
-        //     .create(true)
-        //     .append(false)
-        //     .write(true)
-        //     .open(tmp_dir()?.join("sdf"))?;
-        // f.write_all(&mut receiver.as_slice())?;
+        let mut rx = uploader.on_progress();
+        tokio::spawn(async move {
+            while let Ok(percent) = rx.recv().await {
+                println!("percent: {:.4}%", percent);
+            }
+        });
+        uploader.send().await?;
 
         Ok(())
     }

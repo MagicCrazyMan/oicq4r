@@ -30,7 +30,7 @@ where
 use std::path::PathBuf;
 
 #[cfg(test)]
-fn tmp_dir() -> Result<PathBuf, std::io::Error> {
+pub(crate) fn tmp_dir() -> Result<PathBuf, std::io::Error> {
     use std::fs;
 
     let tmp_dir = std::env::current_dir()?.join("tmp");
