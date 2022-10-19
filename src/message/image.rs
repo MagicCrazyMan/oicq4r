@@ -169,6 +169,10 @@ impl Image<'_> {
         self.fid = fid
     }
 
+    pub fn data(&self) -> &[u8] {
+        self.element.data.as_slice()
+    }
+
     pub fn size(&self) -> u64 {
         self.element.size
     }

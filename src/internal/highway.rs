@@ -438,7 +438,7 @@ impl<R: AsyncRead + Unpin> Uploader<R> {
 pub async fn highway_upload<R, P>(
     client: &Client,
     source: R,
-    params: P,
+    params: &P,
     socket_addr: Option<SocketAddrV4>,
 ) -> Result<Uploader<R>, Error>
 where
@@ -449,7 +449,7 @@ where
 
     if let Some(socket_addr) = socket_addr {
         let tcp_stream = TcpSocket::new_v4()?.connect(socket_addr.into()).await?;
-        let uploader = Uploader::new(client, tcp_stream, &params, source).await?;
+        let uploader = Uploader::new(client, tcp_stream, params, source).await?;
         Ok(uploader)
     } else {
         Err(Error::from(HighwayError::UploadChannelNotExisted))
@@ -458,7 +458,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
+    use std::{io::Read, str::FromStr};
 
     use super::*;
     use crate::{client::Client, init_logger, tmp_dir};
@@ -491,15 +491,14 @@ mod tests {
     async fn test_upload() -> Result<(), Error> {
         init_logger()?;
 
-        let mut file = std::fs::File::open(tmp_dir()?.join("qrcode.jpg"))?;
+        let mut file = std::fs::File::open(tmp_dir()?.join("sjhs001.xyz_0002.jpg"))?;
         let mut buf = Vec::with_capacity(2048);
         file.read_to_end(&mut buf)?;
         let mut sliced = buf.as_slice();
 
         let client = Client::default(640279992).await;
 
-        let tcp = TcpStream::connect("localhost:1111").await?;
-        let uploader = Uploader::new(&client, tcp, &Params(buf.clone()), &mut sliced).await?;
+        let uploader = highway_upload(&client, &mut sliced, &Params(buf.clone()), Some("127.0.0.1:1111".parse()?)).await?;
 
         let mut rx = uploader.on_progress();
         tokio::spawn(async move {

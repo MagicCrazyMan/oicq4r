@@ -1,12 +1,20 @@
+use std::{
+    net::{Ipv4Addr, SocketAddrV4},
+    str::FromStr,
+};
+
 use async_trait::async_trait;
 
 use crate::{
     client::Client,
     core::protobuf::{self, ProtobufElement, ProtobufObject},
     error::Error,
+    internal::highway::HighwayError,
     message::image::Image,
     ToHexString,
 };
+
+use super::highway::{highway_upload, CommandId, HighwayUploadParameters};
 
 #[async_trait]
 pub trait Contractable {
@@ -137,7 +145,66 @@ pub trait Contractable {
                 // 上传成功
                 return Ok(());
             }
-            
+
+            let ip = rsp.try_remove(&(6 + j))?;
+            let ip = if let ProtobufElement::String(ip) = ip {
+                ip
+            } else {
+                let mut ip: ProtobufObject = ip.try_into()?;
+                ip.try_remove(&0)?.try_into()?
+            };
+
+            let port = rsp.try_remove(&(7 + j))?;
+            let port = if let ProtobufElement::Integer(port) = port {
+                port
+            } else {
+                let mut port: ProtobufObject = port.try_into()?;
+                port.try_remove(&0)?.try_into()?
+            };
+            let socket_addr = SocketAddrV4::new(Ipv4Addr::from_str(ip.as_str())?, port as u16);
+
+            let ticket: Vec<u8> = rsp.try_remove(&(8 + j))?.try_into()?;
+
+            struct Parameters {
+                j: u32,
+                // image: &'a Image<'a>,
+                ticket: Vec<u8>,
+            }
+            impl HighwayUploadParameters for Parameters {
+                fn command_id(&self) -> super::highway::CommandId {
+                    self.j
+                        .eq(&0)
+                        .then_some(CommandId::GroupImage)
+                        .unwrap_or(CommandId::DmImage)
+                }
+
+                fn size(&self) -> u64 {
+                    todo!()
+                }
+
+                fn md5(&self) -> [u8; 16] {
+                    todo!()
+                }
+
+                fn ticket(&self) -> Result<&[u8], HighwayError> {
+                    Ok(&self.ticket)
+                }
+            }
+
+            let a = image.data().to_vec();
+            let uploader = highway_upload(
+                self.client(),
+                &mut a.as_slice(),
+                &Parameters {
+                    j,
+                    ticket,
+                },
+                Some(socket_addr),
+            )
+            .await?;
+
+            uploader.send().await?;
+
             Ok(())
         }
     }

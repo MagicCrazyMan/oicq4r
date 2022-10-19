@@ -19,6 +19,7 @@ pub enum ErrorKind {
     StdTryFromSliceError(std::array::TryFromSliceError),
     StdFromUtf8Error(std::string::FromUtf8Error),
     StdIoError(std::io::Error),
+    StdAddrParseError(std::net::AddrParseError),
     ReqwestError(reqwest::Error),
     TokioJoinError(tokio::task::JoinError),
     Flate2DecompressError(flate2::DecompressError),
@@ -51,6 +52,7 @@ impl Display for Error {
             ErrorKind::ImageError(err) => err.fmt(f),
             ErrorKind::StringifyError(msg) => f.write_str(msg),
             ErrorKind::Base64DecodeError(err) => err.fmt(f),
+            ErrorKind::StdAddrParseError(err) => err.fmt(f),
         }
     }
 }
@@ -140,6 +142,12 @@ impl From<tokio::task::JoinError> for Error {
 impl From<std::array::TryFromSliceError> for Error {
     fn from(err: std::array::TryFromSliceError) -> Self {
         Self(ErrorKind::StdTryFromSliceError(err))
+    }
+}
+
+impl From<std::net::AddrParseError> for Error {
+    fn from(err: std::net::AddrParseError) -> Self {
+        Self(ErrorKind::StdAddrParseError(err))
     }
 }
 
