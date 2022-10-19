@@ -9,13 +9,14 @@ use tokio::{
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let listener = TcpListener::bind("localhost:1111").await?;
+    let listener = TcpListener::bind("0.0.0.0:1111").await?;
 
     while let Ok((mut stream, _)) = listener.accept().await {
         tokio::spawn(async move {
             let mut file = tokio::fs::OpenOptions::new()
                 .create(true)
-                .append(true)
+                .append(false)
+                .write(true)
                 .open("./tmp/qqqq.jpg")
                 .await
                 .unwrap();

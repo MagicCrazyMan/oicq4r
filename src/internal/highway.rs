@@ -69,6 +69,7 @@ pub enum CommandId {
     OCR = 76,
 }
 
+/// HighwayUpload 配置参数
 pub trait HighwayUploadParameters {
     fn command_id(&self) -> CommandId;
 
@@ -98,9 +99,10 @@ pub trait HighwayUploadParameters {
 }
 
 pin_project! {
+    /// Highway Upload Transformer，将输入的二进制数据分割并封装为上传格式
     #[derive(Debug)]
-    struct Transformer<R> {
-        source: R,
+    struct Transformer<'a> {
+        source: &'a [u8],
         seq: u16,
         buf: Vec<u8>,
         // 总长度
@@ -121,12 +123,12 @@ pin_project! {
     }
 }
 
-impl<R: AsyncRead + Unpin> Transformer<R> {
+impl<'a> Transformer<'a> {
     async fn new<P: HighwayUploadParameters>(
-        client: &Client,
-        params: &P,
-        source: R,
-    ) -> Result<Transformer<R>, Error> {
+        client: &'a Client,
+        params: &'a P,
+        source: &'a [u8],
+    ) -> Result<Transformer<'a>, Error> {
         let data = client.data().await;
         let ext = if params.encrypt() {
             tea::encrypt(params.ext()?, &data.sig.bigdata.session_key)?
@@ -136,7 +138,7 @@ impl<R: AsyncRead + Unpin> Transformer<R> {
 
         Ok(Self {
             source,
-            seq: 25102,
+            seq: rand::random::<u16>(),
             transformed: 0,
             buf: vec![0; 1024 * 1024],
             total: params.size(),
@@ -152,15 +154,13 @@ impl<R: AsyncRead + Unpin> Transformer<R> {
             _pin: PhantomPinned,
         })
     }
-}
 
-impl<R: AsyncRead + Unpin> Transformer<R> {
     fn ended(&self) -> bool {
         self.total == self.transformed
     }
 }
 
-impl<R: AsyncRead + Unpin> Future for Transformer<R> {
+impl<'a> Future for Transformer<'a> {
     type Output = Result<Vec<u8>, std::io::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -224,6 +224,8 @@ impl<R: AsyncRead + Unpin> Future for Transformer<R> {
 }
 
 pin_project! {
+    /// Highway Upload 中负责读取流中的服务器响应数据，用于确认传输数据结果。
+    /// 上传百分比将通过此响应结果计算，而非通过本地已写入的数据量计算。
     #[derive(Debug)]
     pub struct UploadResponder<S> {
         stream: S,
@@ -239,7 +241,10 @@ pin_project! {
     }
 }
 
-impl<S: AsyncRead + Unpin> UploadResponder<S> {
+impl<S> UploadResponder<S>
+where
+    S: AsyncRead + Unpin,
+{
     fn new(stream: S) -> Self {
         Self {
             stream,
@@ -253,7 +258,10 @@ impl<S: AsyncRead + Unpin> UploadResponder<S> {
     }
 }
 
-impl<S: AsyncRead + Unpin> Future for UploadResponder<S> {
+impl<S> Future for UploadResponder<S>
+where
+    S: AsyncRead + Unpin,
+{
     type Output = Result<(), Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -310,10 +318,15 @@ impl<S: AsyncRead + Unpin> Future for UploadResponder<S> {
 }
 
 pin_project! {
+    /// Highway Upload 中负责写入数据至服务器
+    ///
+    /// 该结构会同时生成一个 [`Transformer`] 将原始数据按长度编码成封装数据块再上传，
+    /// 且编码模式为单块编码后单块上传，上传完成后再继续下一数据块的编码，以此交替直至上传完成。
+    /// 不会立即就完成所有数据的编码，避免大文件上传时大幅占用内容空间。
     #[derive(Debug)]
-    pub struct UploadProgress<S, R> {
+    pub struct UploadProgress<'a, S> {
         stream: S,
-        transformer: Transformer<R>,
+        transformer: Transformer<'a>,
 
         // 本次已经编码，等待上传的数据
         queue: Vec<u8>,
@@ -328,13 +341,19 @@ pin_project! {
     }
 }
 
-impl<S: AsyncWrite + Unpin, R: AsyncRead + Unpin> UploadProgress<S, R> {
-    async fn new<P: HighwayUploadParameters>(
+impl<'a, S> UploadProgress<'a, S>
+where
+    S: AsyncWrite + Unpin,
+{
+    async fn new<P>(
         stream: S,
-        client: &Client,
-        params: &P,
-        source: R,
-    ) -> Result<Self, Error> {
+        client: &'a Client,
+        params: &'a P,
+        source: &'a [u8],
+    ) -> Result<UploadProgress<'a, S>, Error>
+    where
+        P: HighwayUploadParameters,
+    {
         let transformer = Transformer::new(client, params, source).await?;
         Ok(Self {
             stream,
@@ -348,7 +367,10 @@ impl<S: AsyncWrite + Unpin, R: AsyncRead + Unpin> UploadProgress<S, R> {
     }
 }
 
-impl<S: AsyncWrite + Unpin, R: AsyncRead + Unpin> Future for UploadProgress<S, R> {
+impl<'a, S> Future for UploadProgress<'a, S>
+where
+    S: AsyncWrite + Unpin,
+{
     type Output = Result<(), Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -369,7 +391,6 @@ impl<S: AsyncWrite + Unpin, R: AsyncRead + Unpin> Future for UploadProgress<S, R
         // 检查当前已编码的数据是否已经上传完成，
         // 如果已经上传完成，则再去读取新的编码数据
         else if me.queue.len() == 0 {
-            // SAFETY，因为实际上 Transformer 的数据只会通过 AsyncRead + Unpin 创建，所以此处是安全的
             unsafe {
                 let transformer = Pin::new_unchecked(me.transformer);
                 *me.queue = ready!(transformer.poll(cx)?);
@@ -382,7 +403,6 @@ impl<S: AsyncWrite + Unpin, R: AsyncRead + Unpin> Future for UploadProgress<S, R
         else {
             // 检查是否已经可以上传
             let stream = Pin::new(me.stream);
-            // ready!(stream.poll_write_ready(cx))?;
 
             // 上传编码数据
             let n = ready!(stream.poll_write(cx, &me.queue[*me.uploaded..]))?;
@@ -400,21 +420,21 @@ impl<S: AsyncWrite + Unpin, R: AsyncRead + Unpin> Future for UploadProgress<S, R
 
 pin_project! {
     #[derive(Debug)]
-    pub struct Uploader<R> {
+    pub struct Uploader<'a> {
         responder: UploadResponder<OwnedReadHalf>,
-        progress: UploadProgress<OwnedWriteHalf, R>,
+        progress: UploadProgress<'a, OwnedWriteHalf>,
         #[pin]
         _pin: PhantomPinned
     }
 }
 
-impl<R: AsyncRead + Unpin> Uploader<R> {
+impl<'a> Uploader<'a> {
     async fn new<P: HighwayUploadParameters>(
-        client: &Client,
+        client: &'a Client,
         stream: TcpStream,
-        params: &P,
-        source: R,
-    ) -> Result<Self, Error> {
+        params: &'a P,
+        source: &'a [u8],
+    ) -> Result<Uploader<'a>, Error> {
         let (read, write) = stream.into_split();
         Ok(Self {
             responder: UploadResponder::new(read),
@@ -431,18 +451,16 @@ impl<R: AsyncRead + Unpin> Uploader<R> {
         let (a, b) = tokio::join!(self.responder, self.progress,);
 
         a.and(b)
-
     }
 }
 
-pub async fn highway_upload<R, P>(
-    client: &Client,
-    source: R,
-    params: &P,
+pub async fn highway_upload<'a, P>(
+    client: &'a Client,
+    source: &'a [u8],
+    params: &'a P,
     socket_addr: Option<SocketAddrV4>,
-) -> Result<Uploader<R>, Error>
+) -> Result<Uploader<'a>, Error>
 where
-    R: AsyncRead + Unpin,
     P: HighwayUploadParameters,
 {
     let socket_addr = socket_addr.or(client.data().await.sig.bigdata.socket_addr);
@@ -458,7 +476,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Read, str::FromStr};
+    use std::io::Read;
 
     use super::*;
     use crate::{client::Client, init_logger, tmp_dir};
@@ -498,7 +516,14 @@ mod tests {
 
         let client = Client::default(640279992).await;
 
-        let uploader = highway_upload(&client, &mut sliced, &Params(buf.clone()), Some("127.0.0.1:1111".parse()?)).await?;
+        let param = Params(buf.clone());
+        let uploader = highway_upload(
+            &client,
+            &mut sliced,
+            &param,
+            Some("127.0.0.1:1111".parse()?),
+        )
+        .await?;
 
         let mut rx = uploader.on_progress();
         tokio::spawn(async move {

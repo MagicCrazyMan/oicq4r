@@ -14,7 +14,7 @@ use crate::{
     ToHexString,
 };
 
-use super::highway::{highway_upload, CommandId, HighwayUploadParameters};
+use super::highway::{self, highway_upload, CommandId, HighwayUploadParameters};
 
 #[async_trait]
 pub trait Contractable {
@@ -165,13 +165,14 @@ pub trait Contractable {
 
             let ticket: Vec<u8> = rsp.try_remove(&(8 + j))?.try_into()?;
 
-            struct Parameters {
+            /// 参数配置
+            struct Parameters<'a> {
                 j: u32,
-                // image: &'a Image<'a>,
+                image: &'a Image<'a>,
                 ticket: Vec<u8>,
             }
-            impl HighwayUploadParameters for Parameters {
-                fn command_id(&self) -> super::highway::CommandId {
+            impl<'a> HighwayUploadParameters for Parameters<'a> {
+                fn command_id(&self) -> CommandId {
                     self.j
                         .eq(&0)
                         .then_some(CommandId::GroupImage)
@@ -179,29 +180,22 @@ pub trait Contractable {
                 }
 
                 fn size(&self) -> u64 {
-                    todo!()
+                    self.image.size()
                 }
 
                 fn md5(&self) -> [u8; 16] {
-                    todo!()
+                    self.image.md5()
                 }
 
                 fn ticket(&self) -> Result<&[u8], HighwayError> {
-                    Ok(&self.ticket)
+                    Ok(self.ticket.as_slice())
                 }
             }
 
-            let a = image.data().to_vec();
-            let uploader = highway_upload(
-                self.client(),
-                &mut a.as_slice(),
-                &Parameters {
-                    j,
-                    ticket,
-                },
-                Some(socket_addr),
-            )
-            .await?;
+            let param = Parameters { j, image, ticket };
+            let mut source = image.data();
+            let uploader =
+                highway_upload(self.client(), &mut source, &param, Some(socket_addr)).await?;
 
             uploader.send().await?;
 
