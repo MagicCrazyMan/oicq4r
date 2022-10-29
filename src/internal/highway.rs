@@ -447,7 +447,7 @@ impl<'a> Uploader<'a> {
         self.responder.progress_tx.subscribe()
     }
 
-    pub async fn send(self) -> Result<(), Error> {
+    pub async fn upload(self) -> Result<(), Error> {
         let (a, b) = tokio::join!(self.responder, self.progress,);
 
         a.and(b)
@@ -531,7 +531,7 @@ mod tests {
                 println!("percent: {:.4}%", percent);
             }
         });
-        uploader.send().await?;
+        uploader.upload().await?;
 
         Ok(())
     }

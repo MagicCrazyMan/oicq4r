@@ -4,17 +4,19 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::future::join_all;
+use tokio::join;
 
 use crate::{
     client::Client,
     core::protobuf::{self, ProtobufElement, ProtobufObject},
     error::Error,
     internal::highway::HighwayError,
-    message::image::Image,
+    message::element::{MessageElement, Quotable, ImageElement},
     ToHexString,
 };
 
-use super::highway::{self, highway_upload, CommandId, HighwayUploadParameters};
+use super::highway::{highway_upload, CommandId, HighwayUploadParameters};
 
 #[async_trait]
 pub trait Contractable {
@@ -27,7 +29,7 @@ pub trait Contractable {
     fn dm(&self) -> bool;
 
     /// 获取私聊图片 fid
-    async fn off_pic_up(&self, images: &[Image]) -> Result<ProtobufElement, Error> {
+    async fn off_pic_up(&self, images: &[&mut ImageElement]) -> Result<ProtobufElement, Error> {
         let client = self.client();
         let mut data = client.data().await;
 
@@ -50,7 +52,7 @@ pub trait Contractable {
                 (12, ProtobufElement::from(1)),
                 (
                     13,
-                    ProtobufElement::from(image.origin().then_some(1).unwrap_or(0)),
+                    ProtobufElement::from(image.is_origin().then_some(1).unwrap_or(0)),
                 ),
                 (14, ProtobufElement::from(image.width())),
                 (15, ProtobufElement::from(image.height())),
@@ -78,7 +80,7 @@ pub trait Contractable {
     }
 
     /// 获取群聊图片fid
-    async fn group_pic_up(&self, images: &[Image]) -> Result<ProtobufElement, Error> {
+    async fn group_pic_up(&self, images: &[&mut ImageElement]) -> Result<ProtobufElement, Error> {
         let client = self.client();
         let mut data = client.data().await;
 
@@ -104,7 +106,7 @@ pub trait Contractable {
                 (15, ProtobufElement::from(1052)),
                 (
                     16,
-                    ProtobufElement::from(image.origin().then_some(1).unwrap_or(0)),
+                    ProtobufElement::from(image.is_origin().then_some(1).unwrap_or(0)),
                 ),
                 (18, ProtobufElement::from(0)),
                 (19, ProtobufElement::from(0)),
@@ -129,7 +131,14 @@ pub trait Contractable {
         Ok(decoded.try_remove(&3)?)
     }
 
-    async fn upload_image(&self, image: &mut Image, mut rsp: ProtobufObject) -> Result<(), Error> {
+    async fn pre_process<S, Q>(&self, sendable: S, quoted: Quotable<Q>)
+    where
+        S: MessageElement + Send,
+        Q: MessageElement + Send,
+    {
+    }
+
+    async fn upload_image(&self, image: &mut ImageElement, mut rsp: ProtobufObject) -> Result<(), Error> {
         let j = self.dm().then_some(1).unwrap_or(0);
 
         let tmp: isize = rsp.try_remove(&(2 + j))?.try_into()?;
@@ -138,7 +147,7 @@ pub trait Contractable {
             Err(Error::from(msg))
         } else {
             let fid = rsp.try_remove(&(9 + j))?;
-            image.set_fid(fid);
+            image.set_fid(Some(fid));
 
             let tmp: isize = rsp.try_remove(&(4 + j))?.try_into()?;
             if tmp != 0 {
@@ -168,7 +177,7 @@ pub trait Contractable {
             /// 参数配置
             struct Parameters<'a> {
                 j: u32,
-                image: &'a Image<'a>,
+                image: &'a ImageElement,
                 ticket: Vec<u8>,
             }
             impl<'a> HighwayUploadParameters for Parameters<'a> {
@@ -197,14 +206,21 @@ pub trait Contractable {
             let uploader =
                 highway_upload(self.client(), &mut source, &param, Some(socket_addr)).await?;
 
-            uploader.send().await?;
+            uploader.upload().await?;
 
             Ok(())
         }
     }
 
-    async fn upload_images(&self, images: &[Image]) -> Result<(), Error> {
-        for chunk in images.chunks(20) {
+    /// 批量上传图片
+    async fn upload_images<'a, T>(&self, mut images: T) -> Result<Vec<Result<(), Error>>, Error>
+    where
+        T: 'a + Send + AsMut<[&'a mut ImageElement]>,
+    {
+        let images = images.as_mut();
+        let mut upload_results = Vec::with_capacity(images.len());
+
+        for chunk in images.chunks_mut(20) {
             let rsp = if self.dm() {
                 self.off_pic_up(chunk).await?
             } else {
@@ -217,11 +233,17 @@ pub trait Contractable {
                 vec![rsp]
             };
 
+            let mut jobs = Vec::with_capacity(chunk.len());
             for (image, rsp) in chunk.into_iter().zip(rsp.into_iter()) {
                 let rsp: ProtobufObject = rsp.try_into()?;
+                jobs.push(self.upload_image(*image, rsp));
             }
+
+            // 等待所有上传任务完成
+            let results = join_all(jobs).await;
+            upload_results.extend(results);
         }
 
-        todo!()
+        Ok(upload_results)
     }
 }

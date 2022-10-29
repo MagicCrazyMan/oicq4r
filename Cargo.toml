@@ -13,6 +13,7 @@ bytes = "1.2.1"
 chrono = "0.4.22"
 fern = { version = "0.6.1", features = ["colored", "chrono"] }
 flate2 = "1.0.24"
+futures = "0.3.25"
 image = "0.24.4"
 log = "0.4.17"
 log4rs = "1.1.1"
