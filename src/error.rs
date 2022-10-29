@@ -1,9 +1,12 @@
 use std::fmt::Display;
 
-use crate::{core::{
-    base_client::ClientError, jce::JceError, network::NetworkError, protobuf::ProtobufError,
-    tea::TeaError, tlv::TlvError,
-}, internal::highway::HighwayError};
+use crate::{
+    core::{
+        base_client::ClientError, jce::JceError, network::NetworkError,
+        protobuf::decode::DecodeError, tea::TeaError, tlv::TlvError,
+    },
+    internal::highway::HighwayError,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -12,7 +15,8 @@ pub enum ErrorKind {
     JceError(JceError),
     TeaError(TeaError),
     TlvError(TlvError),
-    ProtobufError(ProtobufError),
+    ProtobufError(DecodeError),
+    ProtobufEncodeError(protobuf::Error),
     NetworkError(NetworkError),
     ClientError(ClientError),
     HighwayError(HighwayError),
@@ -40,6 +44,7 @@ impl Display for Error {
             ErrorKind::TeaError(err) => err.fmt(f),
             ErrorKind::TlvError(err) => err.fmt(f),
             ErrorKind::ProtobufError(err) => err.fmt(f),
+            ErrorKind::ProtobufEncodeError(err) => err.fmt(f),
             ErrorKind::NetworkError(err) => err.fmt(f),
             ErrorKind::ClientError(err) => err.fmt(f),
             ErrorKind::HighwayError(err) => err.fmt(f),
@@ -97,8 +102,8 @@ impl From<TlvError> for Error {
     }
 }
 
-impl From<ProtobufError> for Error {
-    fn from(err: ProtobufError) -> Self {
+impl From<DecodeError> for Error {
+    fn from(err: DecodeError) -> Self {
         Self(ErrorKind::ProtobufError(err))
     }
 }
@@ -172,5 +177,11 @@ impl From<base64::DecodeError> for Error {
 impl From<image::error::ImageError> for Error {
     fn from(err: image::error::ImageError) -> Self {
         Self(ErrorKind::ImageError(err))
+    }
+}
+
+impl From<protobuf::Error> for Error {
+    fn from(err: protobuf::Error) -> Self {
+        Self(ErrorKind::ProtobufEncodeError(err))
     }
 }

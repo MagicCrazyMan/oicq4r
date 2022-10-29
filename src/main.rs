@@ -1,6 +1,10 @@
 use oicq4r::{
-    core::protobuf::{self, ProtobufElement, ProtobufObject},
+    core::protobuf::{
+        decode::{DecodeProtobuf, DecodedObject},
+        encode::{EncodeProtobuf, EncodedObject},
+    },
     error::Error,
+    to_protobuf,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -39,22 +43,27 @@ async fn main() -> Result<(), Error> {
                             if buf.len() >= 1 + 4 + 4 + head_len + chunk_len + 1 {
                                 let mut head_buf = vec![0; head_len];
                                 reader.read_exact(&mut head_buf).await.unwrap();
-                                let mut head = protobuf::decode(&mut head_buf.as_slice()).unwrap();
-                                let mut metadata: ProtobufObject =
+
+                                let mut head =
+                                    (&mut head_buf.as_slice()).decode_protobuf().unwrap();
+                                let mut metadata: DecodedObject =
                                     head.try_remove(&2).unwrap().try_into().unwrap();
                                 let total_len: isize =
                                     metadata.try_remove(&2).unwrap().try_into().unwrap();
 
-                                let nested = ProtobufObject::from([
-                                    (2, ProtobufElement::from(total_len as isize)),
-                                    (3, ProtobufElement::from(received_len as isize)),
-                                    (4, ProtobufElement::from(chunk_len as isize)),
-                                ]);
-                                let response_obj = ProtobufObject::from([
-                                    (2, ProtobufElement::from(protobuf::encode(&nested).unwrap())),
-                                    (3, ProtobufElement::from(0)),
-                                ]);
-                                let encoded = protobuf::encode(&response_obj).unwrap();
+                                let encoded = {
+                                    let nested = EncodedObject::from([
+                                        (2, to_protobuf!(total_len)),
+                                        (3, to_protobuf!(received_len)),
+                                        (4, to_protobuf!(chunk_len)),
+                                    ]);
+                                    EncodedObject::from([
+                                        (2, to_protobuf!(nested.encode().unwrap())),
+                                        (3, to_protobuf!(0)),
+                                    ])
+                                    .encode()
+                                    .unwrap()
+                                };
 
                                 write.write_u8(0).await.unwrap();
                                 write.write_u32(encoded.len() as u32).await.unwrap();

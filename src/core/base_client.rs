@@ -22,8 +22,12 @@ use tokio::{
 };
 
 use crate::{
-    core::{network::LoginCommand, protobuf::ProtobufElement},
+    core::{
+        network::LoginCommand,
+        protobuf::decode::{DecodeProtobuf, DecodedElement, DecodedObject},
+    },
     error::Error,
+    to_protobuf,
 };
 
 use super::{
@@ -33,7 +37,7 @@ use super::{
     io::{ReadExt, WriteExt},
     jce::{self, JceElement, JceError, JceObject},
     network::{LoginRequest, Network, NetworkState, Request, Response, UniRequest, SSO},
-    protobuf::{self, ProtobufObject},
+    protobuf::encode::{EncodedObject, EncodeProtobuf},
     tea,
     tlv::{self, ReadTlvExt, TlvError, WriteTlvExt},
 };
@@ -121,11 +125,12 @@ impl SIG {
             buf.write_u8(0).unwrap();
             buf.write_i32(0x19e39).unwrap();
 
-            protobuf::encode(&ProtobufObject::from([
-                (1, ProtobufElement::from(1152)),
-                (2, ProtobufElement::from(9)),
-                (4, ProtobufElement::from(buf)),
-            ]))
+            EncodedObject::from([
+                (1, to_protobuf!(1152)),
+                (2, to_protobuf!(9)),
+                (4, to_protobuf!(buf.as_slice())),
+            ])
+            .encode()
             .unwrap()
         };
 
@@ -384,27 +389,26 @@ impl BaseClient {
                         })
                         .and_then(|mut obj| {
                             let buf: Vec<u8> = obj.try_remove(&5)?.try_into()?;
-                            let mut decoded = protobuf::decode(&mut buf.as_slice())?;
+                            let mut decoded = (&mut buf.as_slice()).decode_protobuf()?;
 
                             let d1281: Vec<u8> = decoded.try_remove(&1281)?.try_into()?;
-                            let mut d1281_decoded = protobuf::decode(&mut d1281.as_slice())?;
+                            let mut d1281_decoded = (&mut d1281.as_slice()).decode_protobuf()?;
 
                             let n1: Vec<u8> = d1281_decoded.try_remove(&1)?.try_into()?;
                             let n2: Vec<u8> = d1281_decoded.try_remove(&2)?.try_into()?;
                             let n2: [u8; 16] = n2[..16].try_into()?;
 
                             let mut socket_addr = None;
-                            let n3: Vec<ProtobufElement> =
+                            let n3: Vec<DecodedElement> =
                                 d1281_decoded.try_remove(&3)?.try_into()?;
                             for e in n3 {
-                                let mut v: ProtobufObject = e.try_into()?;
+                                let mut v: DecodedObject = e.try_into()?;
 
                                 let i: isize = v.try_remove(&1)?.try_into()?;
                                 if i == 10 {
-                                    let mut l: Vec<ProtobufElement> =
+                                    let mut l: Vec<DecodedElement> =
                                         v.try_remove(&2)?.try_into()?;
-
-                                    let mut d: ProtobufObject = l.remove(0).try_into()?;
+                                    let mut d: DecodedObject = l.remove(0).try_into()?;
 
                                     let ip_integer: isize = d.try_remove(&2)?.try_into()?;
                                     let ipv4 = Ipv4Addr::from(ip_integer as u32);
@@ -1145,19 +1149,20 @@ impl DataCenter {
     }
 
     fn build_register_request(&mut self, logout: bool) -> Result<LoginRequest, Error> {
-        let pb_buf = protobuf::encode(&ProtobufObject::from([(
+        let pb_buf = EncodedObject::from([(
             1,
-            ProtobufElement::from([
-                ProtobufElement::Object(ProtobufObject::from([
-                    (1, ProtobufElement::from(46)),
-                    (2, ProtobufElement::from(current_unix_timestamp_as_secs())),
+            to_protobuf!([
+                to_protobuf!(EncodedObject::from([
+                    (1, to_protobuf!(46)),
+                    (2, to_protobuf!(current_unix_timestamp_as_secs()))
                 ])),
-                ProtobufElement::Object(ProtobufObject::from([
-                    (1, ProtobufElement::from(283)),
-                    (2, ProtobufElement::from(0)),
+                to_protobuf!(EncodedObject::from([
+                    (1, to_protobuf!(283)),
+                    (2, to_protobuf!(0))
                 ])),
             ]),
-        )]))?;
+        )])
+        .encode()?;
 
         let d = &self.device;
         let svc_req_register = jce::encode_nested(JceObject::try_from([

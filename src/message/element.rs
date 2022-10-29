@@ -4,7 +4,7 @@ use rand::Rng;
 use reqwest::{header::HeaderMap, IntoUrl};
 use serde_json::Value;
 
-use crate::{error::Error, core::protobuf::ProtobufElement};
+use crate::{error::Error, core::protobuf::decode::DecodedObject};
 
 pub trait MessageElement {}
 
@@ -516,7 +516,7 @@ impl ChainElement for BFaceElement {}
 pub struct ImageElement {
     data: Vec<u8>,
     /// fid 后续从服务器中获取
-    fid: Option<ProtobufElement>,
+    fid: Option<Vec<u8>>,
     /// 图片类型,有下列几种
     /// - jpg: `1000`
     /// - png: `1001`
@@ -683,11 +683,11 @@ impl ImageElement {
         self.origin
     }
 
-    pub fn fid(&self) -> Option<&ProtobufElement> {
+    pub fn fid(&self) -> Option<&Vec<u8>> {
         self.fid.as_ref()
     }
 
-    pub fn set_fid(&mut self, fid: Option<ProtobufElement>) {
+    pub fn set_fid(&mut self, fid: Option<Vec<u8>>) {
         self.fid = fid;
     }
 }

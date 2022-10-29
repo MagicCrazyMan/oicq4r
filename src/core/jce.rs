@@ -851,10 +851,9 @@ where
 
 #[cfg(test)]
 mod test {
-    use crate::core::{
-        helper::current_unix_timestamp_as_secs,
-        jce,
-        protobuf::{self, ProtobufElement, ProtobufObject},
+    use crate::{
+        core::{helper::current_unix_timestamp_as_secs, jce, protobuf::encode::{EncodedObject, EncodeProtobuf}},
+        to_protobuf,
     };
 
     use super::*;
@@ -862,19 +861,20 @@ mod test {
     #[test]
     fn test_register() {
         let logout = false;
-        let pb_buf = protobuf::encode(&ProtobufObject::from([(
+        let pb_buf = EncodedObject::from([(
             1,
-            ProtobufElement::from([
-                ProtobufElement::Object(ProtobufObject::from([
-                    (1, ProtobufElement::from(46)),
-                    (2, ProtobufElement::from(current_unix_timestamp_as_secs())),
+            to_protobuf!([
+                to_protobuf!(EncodedObject::from([
+                    (1, to_protobuf!(46)),
+                    (2, to_protobuf!(current_unix_timestamp_as_secs()))
                 ])),
-                ProtobufElement::Object(ProtobufObject::from([
-                    (1, ProtobufElement::from(283)),
-                    (2, ProtobufElement::from(0)),
+                to_protobuf!(EncodedObject::from([
+                    (1, to_protobuf!(283)),
+                    (2, to_protobuf!(0))
                 ])),
             ]),
-        )]))
+        )])
+        .encode()
         .unwrap();
 
         assert_eq!(17, pb_buf.len());
