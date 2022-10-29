@@ -1,13 +1,13 @@
-/// Protobuf 的编解码采用各自采用两种不同的处理方式
-/// 
-
 pub mod decode;
 pub mod encode;
 
 #[cfg(test)]
 mod test {
     use crate::{
-        core::{io::WriteExt, protobuf::encode::{EncodedObject, EncodeProtobuf}},
+        core::{
+            io::WriteExt,
+            protobuf::encode::{EncodeProtobuf, EncodedObject},
+        },
         error::Error,
         to_protobuf,
     };
@@ -37,10 +37,7 @@ mod test {
                 7,
                 to_protobuf!(vec![to_protobuf!(123), to_protobuf!("345")]),
             ),
-            (
-                8,
-                to_protobuf!([to_protobuf!(43), to_protobuf!("dfg")]),
-            ),
+            (8, to_protobuf!([to_protobuf!(43), to_protobuf!("dfg")])),
         ])
         .encode()?;
 
