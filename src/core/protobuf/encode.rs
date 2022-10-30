@@ -4,7 +4,8 @@ use protobuf::CodedOutputStream;
 
 /// Protobuf 编码元素
 ///
-/// 所持有的所有实际元素均为引用或基础数据类型，元素容器及对象容器则独立持有所有权
+/// 所持有的所有实际元素均为引用或基础数据类型，元素容器及对象容器则持有所有权。
+/// 在保证代码可读性的同时避免重复克隆实际数据
 #[derive(Debug, Clone)]
 pub enum Element<'a> {
     Integer(i128),
