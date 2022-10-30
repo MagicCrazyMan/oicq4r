@@ -2,309 +2,189 @@ use std::collections::HashMap;
 
 use protobuf::CodedOutputStream;
 
-/// 标记可以编码为 Protobuf 的数据
-pub trait EncodeProtobuf {
-    fn size_hint(&self) -> usize;
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error>;
+/// Protobuf 编码元素
+///
+/// 所持有的所有实际元素均为引用或基础数据类型，元素容器及对象容器则独立持有所有权
+#[derive(Debug, Clone)]
+pub enum Element<'a> {
+    Integer(i128),
+    Double(f64),
+    Bytes(&'a [u8]),
+    String(&'a str),
+    Array(Vec<Element<'a>>),
+    Object(Object<'a>),
 }
 
-impl EncodeProtobuf for Vec<u8> {
+impl<'a> Element<'a> {
     fn size_hint(&self) -> usize {
-        self.len()
+        match self {
+            Element::Integer(_) => 8,
+            Element::Double(_) => 8,
+            Element::Bytes(v) => v.len(),
+            Element::String(v) => v.as_bytes().len(),
+            Element::Array(a) => a.iter().map(|v| v.size_hint()).sum(),
+            Element::Object(o) => o.len() * 4 + o.iter().map(|(_, v)| v.size_hint()).sum::<usize>(),
+        }
     }
 
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        self.as_slice().encode_protobuf(tag, stream)
-    }
-}
-
-impl<const N: usize> EncodeProtobuf for [u8; N] {
-    fn size_hint(&self) -> usize {
-        self.len()
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        self.as_slice().encode_protobuf(tag, stream)
-    }
-}
-
-impl EncodeProtobuf for &[u8] {
-    fn size_hint(&self) -> usize {
-        self.len()
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        stream.write_bytes(tag, self)
-    }
-}
-
-impl EncodeProtobuf for isize {
-    fn size_hint(&self) -> usize {
-        (isize::BITS / 8) as usize
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        (*self as i64).encode_protobuf(tag, stream)
-    }
-}
-
-impl EncodeProtobuf for i64 {
-    fn size_hint(&self) -> usize {
-        8
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        if *self < 0 {
-            stream.write_sint64(tag, *self)
-        } else {
-            stream.write_int64(tag, *self)
+    fn encode(&self, tag: u32, stream: &mut CodedOutputStream) -> Result<(), protobuf::Error> {
+        match self {
+            Element::Integer(v) => {
+                let v = *v;
+                if v < 0 {
+                    stream.write_sint64(tag, v as i64)
+                } else {
+                    stream.write_int64(tag, v as i64)
+                }
+            }
+            Element::Double(v) => stream.write_double(tag, *v),
+            Element::Bytes(b) => stream.write_bytes(tag, *b),
+            Element::String(s) => stream.write_string(tag, *s),
+            Element::Array(list) => list.iter().try_for_each(|e| e.encode(tag, stream)),
+            Element::Object(obj) => stream.write_bytes(tag, obj.encode()?.as_slice()),
         }
     }
 }
 
-impl EncodeProtobuf for i32 {
-    fn size_hint(&self) -> usize {
-        4
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        (*self as i64).encode_protobuf(tag, stream)
+impl<'a> From<isize> for Element<'a> {
+    fn from(value: isize) -> Self {
+        Self::Integer(value as i128)
     }
 }
 
-impl EncodeProtobuf for i16 {
-    fn size_hint(&self) -> usize {
-        2
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        (*self as i64).encode_protobuf(tag, stream)
+impl<'a> From<usize> for Element<'a> {
+    fn from(value: usize) -> Self {
+        Self::Integer(value as i128)
     }
 }
 
-impl EncodeProtobuf for i8 {
-    fn size_hint(&self) -> usize {
-        1
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        (*self as i64).encode_protobuf(tag, stream)
+impl<'a> From<i128> for Element<'a> {
+    fn from(value: i128) -> Self {
+        Self::Integer(value)
     }
 }
 
-impl EncodeProtobuf for usize {
-    fn size_hint(&self) -> usize {
-        (usize::BITS / 8) as usize
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        (*self as i64).encode_protobuf(tag, stream)
+impl<'a> From<u128> for Element<'a> {
+    fn from(value: u128) -> Self {
+        Self::Integer(value as i128)
     }
 }
 
-impl EncodeProtobuf for u64 {
-    fn size_hint(&self) -> usize {
-        8
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        (*self as i64).encode_protobuf(tag, stream)
+impl<'a> From<i64> for Element<'a> {
+    fn from(value: i64) -> Self {
+        Self::Integer(value as i128)
     }
 }
 
-impl EncodeProtobuf for u32 {
-    fn size_hint(&self) -> usize {
-        4
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        (*self as i64).encode_protobuf(tag, stream)
+impl<'a> From<u64> for Element<'a> {
+    fn from(value: u64) -> Self {
+        Self::Integer(value as i128)
     }
 }
 
-impl EncodeProtobuf for u16 {
-    fn size_hint(&self) -> usize {
-        2
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        (*self as i64).encode_protobuf(tag, stream)
+impl<'a> From<i32> for Element<'a> {
+    fn from(value: i32) -> Self {
+        Self::Integer(value as i128)
     }
 }
 
-impl EncodeProtobuf for u8 {
-    fn size_hint(&self) -> usize {
-        1
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        (*self as i64).encode_protobuf(tag, stream)
+impl<'a> From<u32> for Element<'a> {
+    fn from(value: u32) -> Self {
+        Self::Integer(value as i128)
     }
 }
 
-impl EncodeProtobuf for f64 {
-    fn size_hint(&self) -> usize {
-        8
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        stream.write_double(tag, *self)
+impl<'a> From<i16> for Element<'a> {
+    fn from(value: i16) -> Self {
+        Self::Integer(value as i128)
     }
 }
 
-impl EncodeProtobuf for f32 {
-    fn size_hint(&self) -> usize {
-        4
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        (*self as f64).encode_protobuf(tag, stream)
+impl<'a> From<u16> for Element<'a> {
+    fn from(value: u16) -> Self {
+        Self::Integer(value as i128)
     }
 }
 
-impl EncodeProtobuf for &str {
-    fn size_hint(&self) -> usize {
-        self.as_bytes().len()
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        stream.write_string(tag, self)
+impl<'a> From<i8> for Element<'a> {
+    fn from(value: i8) -> Self {
+        Self::Integer(value as i128)
     }
 }
 
-impl<'a, T> EncodeProtobuf for T
-where
-    T: AsRef<EncodedObject<'a>>,
-{
-    fn size_hint(&self) -> usize {
-        let obj = self.as_ref();
-        obj.len() * 4 + obj.iter().map(|(_, e)| e.size_hint()).sum::<usize>()
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        stream.write_bytes(tag, &self.as_ref().encode()?)
+impl<'a> From<u8> for Element<'a> {
+    fn from(value: u8) -> Self {
+        Self::Integer(value as i128)
     }
 }
 
-impl EncodeProtobuf for Vec<&dyn EncodeProtobuf> {
-    fn size_hint(&self) -> usize {
-        self.as_slice().size_hint()
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        self.as_slice().encode_protobuf(tag, stream)
+impl<'a> From<f32> for Element<'a> {
+    fn from(value: f32) -> Self {
+        Self::Double(value as f64)
     }
 }
 
-impl<const N: usize> EncodeProtobuf for [&dyn EncodeProtobuf; N] {
-    fn size_hint(&self) -> usize {
-        self.as_slice().size_hint()
-    }
-
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        self.as_slice().encode_protobuf(tag, stream)
+impl<'a> From<f64> for Element<'a> {
+    fn from(value: f64) -> Self {
+        Self::Double(value)
     }
 }
 
-impl EncodeProtobuf for &[&dyn EncodeProtobuf] {
-    fn size_hint(&self) -> usize {
-        self.iter().map(|e| e.size_hint()).sum()
+impl<'a> From<&'a str> for Element<'a> {
+    fn from(value: &'a str) -> Self {
+        Self::String(value)
     }
+}
 
-    fn encode_protobuf(
-        &self,
-        tag: u32,
-        stream: &mut CodedOutputStream,
-    ) -> Result<(), protobuf::Error> {
-        self.iter().try_for_each(|e| e.encode_protobuf(tag, stream))
+impl<'a> From<&'a [u8]> for Element<'a> {
+    fn from(value: &'a [u8]) -> Self {
+        Self::Bytes(value)
+    }
+}
+
+// impl<'a> From<&'a [Element<'a>]> for Element<'a> {
+//     fn from(value: &'a [Element<'a>]) -> Self {
+//         Self::Array(value.to_vec())
+//     }
+// }
+
+impl<'a, const N: usize> From<[Element<'a>; N]> for Element<'a> {
+    fn from(value: [Element<'a>; N]) -> Self {
+        Self::Array(value.to_vec())
+    }
+}
+
+impl<'a> From<Vec<Element<'a>>> for Element<'a> {
+    fn from(value: Vec<Element<'a>>) -> Self {
+        Self::Array(value)
+    }
+}
+
+impl<'a> From<Object<'a>> for Element<'a> {
+    fn from(value: Object<'a>) -> Self {
+        Self::Object(value)
     }
 }
 
 /// Protobuf Object 容器
-pub struct EncodedObject<'a>(HashMap<u32, &'a dyn EncodeProtobuf>);
+#[derive(Debug, Clone)]
+pub struct Object<'a>(HashMap<u32, Element<'a>>);
 
-impl<'a> EncodedObject<'a> {
+impl<'a> std::ops::DerefMut for Object<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<'a> std::ops::Deref for Object<'a> {
+    type Target = HashMap<u32, Element<'a>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> Object<'a> {
     pub fn new() -> Self {
         Self(HashMap::new())
     }
@@ -313,21 +193,24 @@ impl<'a> EncodedObject<'a> {
         Self(HashMap::with_capacity(capacity))
     }
 
-    /// debug 模式下，HashMap 会按照 key(u8) 排序后生成 JceObject，以方便配合 nodejs debug
-    #[cfg(debug_assertions)]
-    pub fn encode(&self) -> Result<Vec<u8>, protobuf::Error> {
+    fn prepare_decode_buf(&self) -> Vec<u8> {
         // 这个 length_hint 不保证计算的大小完全符合实际编码后的大小，仅保证贴近编码后的大小，以避免多次申请内存空间或申请过多内存空间
         let length_hint =
             self.0.len() * 4 + self.0.iter().map(|(_, e)| e.size_hint()).sum::<usize>();
+        Vec::with_capacity(length_hint)
+    }
 
-        let mut buf = Vec::with_capacity(length_hint);
+    /// debug 模式下，HashMap 会按照 key(u32) 排序后生成 Object，以方便配合 nodejs debug
+    #[cfg(debug_assertions)]
+    pub fn encode(&self) -> Result<Vec<u8>, protobuf::Error> {
+        let mut buf = self.prepare_decode_buf();
         let mut stream = CodedOutputStream::new(&mut buf);
 
         let mut list = self.iter().collect::<Vec<_>>();
         list.sort_by(|a, b| (*a.0).cmp(b.0));
 
         list.into_iter()
-            .try_for_each(|(tag, element)| element.encode_protobuf(*tag, &mut stream))?;
+            .try_for_each(|(tag, element)| element.encode(*tag, &mut stream))?;
 
         drop(stream);
         Ok(buf)
@@ -335,25 +218,25 @@ impl<'a> EncodedObject<'a> {
 
     #[cfg(not(debug_assertions))]
     fn encode(&self) -> Result<Vec<u8>, DecodeProtobufError> {
-        let mut buf = Vec::with_capacity(1024);
+        let mut buf = self.prepare_decode_buf();
         let mut stream = CodedOutputStream::new(&mut buf);
 
         self.iter()
-            .try_for_each(|(tag, element)| element.encode_protobuf(*tag, &mut stream))?;
+            .try_for_each(|(tag, element)| element.encode(*tag, &mut stream))?;
 
         drop(stream);
         Ok(buf)
     }
 }
 
-impl<'a, const N: usize> From<[(u32, &'a dyn EncodeProtobuf); N]> for EncodedObject<'a> {
-    fn from(arr: [(u32, &'a dyn EncodeProtobuf); N]) -> Self {
+impl<'a, const N: usize> From<[(u32, Element<'a>); N]> for Object<'a> {
+    fn from(arr: [(u32, Element<'a>); N]) -> Self {
         Self(HashMap::from(arr))
     }
 }
 
-impl<'a, const N: usize> From<[&'a dyn EncodeProtobuf; N]> for EncodedObject<'a> {
-    fn from(arr: [&'a dyn EncodeProtobuf; N]) -> Self {
+impl<'a, const N: usize> From<[Element<'a>; N]> for Object<'a> {
+    fn from(arr: [Element<'a>; N]) -> Self {
         Self(
             arr.into_iter()
                 .enumerate()
@@ -361,31 +244,4 @@ impl<'a, const N: usize> From<[&'a dyn EncodeProtobuf; N]> for EncodedObject<'a>
                 .collect::<HashMap<_, _>>(),
         )
     }
-}
-
-impl<'a> std::ops::DerefMut for EncodedObject<'a> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl<'a> std::ops::Deref for EncodedObject<'a> {
-    type Target = HashMap<u32, &'a dyn EncodeProtobuf>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<'a> AsRef<EncodedObject<'a>> for EncodedObject<'a> {
-    fn as_ref(&self) -> &EncodedObject<'a> {
-        self
-    }
-}
-
-#[macro_export]
-macro_rules! to_protobuf {
-    ($t:expr) => {
-        (&$t as &dyn EncodeProtobuf)
-    };
 }

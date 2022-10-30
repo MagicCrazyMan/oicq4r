@@ -4,7 +4,7 @@ use rand::Rng;
 use reqwest::{header::HeaderMap, IntoUrl};
 use serde_json::Value;
 
-use crate::{error::Error, core::protobuf::decode::DecodedObject};
+use crate::{error::Error, core::protobuf::decode::Object};
 
 pub trait MessageElement {}
 

@@ -4,14 +4,14 @@ use std::{
     io::{Read, Write},
 };
 
-use crate::{error::Error, to_protobuf};
+use crate::error::Error;
 
 use super::{
     base_client::DataCenter,
     device::Platform,
     helper::{current_unix_timestamp_as_millis, BUF_0, BUF_1, BUF_4},
     io::WriteExt,
-    protobuf::encode::{EncodedObject, EncodeProtobuf},
+    protobuf::encode,
     tea::{self, encrypt},
 };
 
@@ -366,16 +366,16 @@ fn pack_body(
         }
         0x52d => {
             let device = &data.device;
-            let buf = EncodedObject::from([
-                (1, to_protobuf!(device.bootloader)),
-                (2, to_protobuf!(device.proc_version.as_str())),
-                (3, to_protobuf!(device.version.codename)),
-                (4, to_protobuf!(device.version.incremental)),
-                (5, to_protobuf!(device.fingerprint.as_str())),
-                (6, to_protobuf!(device.boot_id.as_str())),
-                (7, to_protobuf!(device.android_id.as_str())),
-                (8, to_protobuf!(device.baseband)),
-                (9, to_protobuf!(device.version.incremental)),
+            let buf = encode::Object::from([
+                (1, encode::Element::from(device.bootloader)),
+                (2, encode::Element::from(device.proc_version.as_str())),
+                (3, encode::Element::from(device.version.codename)),
+                (4, encode::Element::from(device.version.incremental)),
+                (5, encode::Element::from(device.fingerprint.as_str())),
+                (6, encode::Element::from(device.boot_id.as_str())),
+                (7, encode::Element::from(device.android_id.as_str())),
+                (8, encode::Element::from(device.baseband)),
+                (9, encode::Element::from(device.version.incremental)),
             ])
             .encode()?;
 

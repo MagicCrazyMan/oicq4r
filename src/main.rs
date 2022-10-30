@@ -1,10 +1,6 @@
 use oicq4r::{
-    core::protobuf::{
-        decode::{DecodeProtobuf, DecodedObject},
-        encode::{EncodeProtobuf, EncodedObject},
-    },
+    core::protobuf::{decode, encode},
     error::Error,
-    to_protobuf,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -45,21 +41,26 @@ async fn main() -> Result<(), Error> {
                                 reader.read_exact(&mut head_buf).await.unwrap();
 
                                 let mut head =
-                                    (&mut head_buf.as_slice()).decode_protobuf().unwrap();
-                                let mut metadata: DecodedObject =
+                                    decode::Object::decode(&mut head_buf.as_slice()).unwrap();
+                                let mut metadata: decode::Object =
                                     head.try_remove(&2).unwrap().try_into().unwrap();
-                                let total_len: isize =
+                                let total_len: i128 =
                                     metadata.try_remove(&2).unwrap().try_into().unwrap();
 
                                 let encoded = {
-                                    let nested = EncodedObject::from([
-                                        (2, to_protobuf!(total_len)),
-                                        (3, to_protobuf!(received_len)),
-                                        (4, to_protobuf!(chunk_len)),
+                                    let nested = encode::Object::from([
+                                        (2, encode::Element::from(total_len)),
+                                        (3, encode::Element::from(received_len)),
+                                        (4, encode::Element::from(chunk_len)),
                                     ]);
-                                    EncodedObject::from([
-                                        (2, to_protobuf!(nested.encode().unwrap())),
-                                        (3, to_protobuf!(0)),
+                                    encode::Object::from([
+                                        (
+                                            2,
+                                            encode::Element::from(
+                                                nested.encode().unwrap().as_slice(),
+                                            ),
+                                        ),
+                                        (3, encode::Element::from(0)),
                                     ])
                                     .encode()
                                     .unwrap()

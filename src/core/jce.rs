@@ -851,26 +851,23 @@ where
 
 #[cfg(test)]
 mod test {
-    use crate::{
-        core::{helper::current_unix_timestamp_as_secs, jce, protobuf::encode::{EncodedObject, EncodeProtobuf}},
-        to_protobuf,
-    };
+    use crate::core::{helper::current_unix_timestamp_as_secs, jce, protobuf::encode};
 
     use super::*;
 
     #[test]
     fn test_register() {
         let logout = false;
-        let pb_buf = EncodedObject::from([(
+        let pb_buf = encode::Object::from([(
             1,
-            to_protobuf!([
-                to_protobuf!(EncodedObject::from([
-                    (1, to_protobuf!(46)),
-                    (2, to_protobuf!(current_unix_timestamp_as_secs()))
+            encode::Element::from([
+                encode::Element::from(encode::Object::from([
+                    (1, encode::Element::from(46)),
+                    (2, encode::Element::from(current_unix_timestamp_as_secs())),
                 ])),
-                to_protobuf!(EncodedObject::from([
-                    (1, to_protobuf!(283)),
-                    (2, to_protobuf!(0))
+                encode::Element::from(encode::Object::from([
+                    (1, encode::Element::from(283)),
+                    (2, encode::Element::from(0)),
                 ])),
             ]),
         )])

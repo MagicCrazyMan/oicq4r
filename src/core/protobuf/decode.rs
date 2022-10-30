@@ -43,69 +43,22 @@ impl From<protobuf::Error> for DecodeError {
     }
 }
 
-pub trait DecodeProtobuf {
-    fn decode_protobuf(&mut self) -> Result<DecodedObject, DecodeError>;
-}
-
-impl<R: Read> DecodeProtobuf for R {
-    fn decode_protobuf(&mut self) -> Result<DecodedObject, DecodeError> {
-        let mut reader = CodedInputStream::new(self);
-        decode_object(&mut reader)
-    }
-}
-
-fn decode_object(reader: &mut CodedInputStream) -> Result<DecodedObject, DecodeError> {
-    let mut result = DecodedObject::with_capacity(20);
-
-    while !reader.eof()? {
-        let k = reader.read_uint32()?;
-        let tag = k >> 3;
-        let typee = k & 0b111;
-
-        let value = match typee {
-            0 => DecodedElement::Integer(reader.read_int64()? as isize),
-            1 => DecodedElement::Integer(reader.read_fixed64()? as isize),
-            2 => {
-                let buf = reader.read_bytes()?;
-                DecodedElement::Bytes(buf)
-            }
-            5 => DecodedElement::Integer(reader.read_fixed32()? as isize),
-            _ => return Err(DecodeError::InvalidType(typee)),
-        };
-
-        if let Some(e) = result.get_mut(&tag) {
-            if let DecodedElement::Array(list) = e {
-                list.push(value);
-            } else {
-                let e = result.remove(&tag).unwrap();
-                let value = DecodedElement::Array(vec![e]);
-                result.insert(tag, value);
-            };
-        } else {
-            result.insert(tag, value);
-        }
-    }
-
-    Ok(result)
-}
-
 /// Protobuf 解码元素
 #[derive(Debug, Clone)]
-pub enum DecodedElement {
-    Null,
-    Integer(isize),
+pub enum Element {
+    Integer(i128),
     Double(f64),
     Bytes(Vec<u8>),
     String(String),
-    Array(Vec<DecodedElement>),
-    Object(DecodedObject),
+    Array(Vec<Element>),
+    Object(Object),
 }
 
-impl TryFrom<DecodedElement> for isize {
+impl TryFrom<Element> for i128 {
     type Error = DecodeError;
 
-    fn try_from(p: DecodedElement) -> Result<Self, Self::Error> {
-        if let DecodedElement::Integer(v) = p {
+    fn try_from(p: Element) -> Result<Self, Self::Error> {
+        if let Element::Integer(v) = p {
             Ok(v)
         } else {
             Err(DecodeError::NotInteger)
@@ -113,11 +66,11 @@ impl TryFrom<DecodedElement> for isize {
     }
 }
 
-impl TryFrom<DecodedElement> for f64 {
+impl TryFrom<Element> for f64 {
     type Error = DecodeError;
 
-    fn try_from(p: DecodedElement) -> Result<Self, Self::Error> {
-        if let DecodedElement::Double(v) = p {
+    fn try_from(p: Element) -> Result<Self, Self::Error> {
+        if let Element::Double(v) = p {
             Ok(v)
         } else {
             Err(DecodeError::NotDouble)
@@ -125,11 +78,11 @@ impl TryFrom<DecodedElement> for f64 {
     }
 }
 
-impl TryFrom<DecodedElement> for Vec<u8> {
+impl TryFrom<Element> for Vec<u8> {
     type Error = DecodeError;
 
-    fn try_from(p: DecodedElement) -> Result<Self, Self::Error> {
-        if let DecodedElement::Bytes(v) = p {
+    fn try_from(p: Element) -> Result<Self, Self::Error> {
+        if let Element::Bytes(v) = p {
             Ok(v)
         } else {
             Err(DecodeError::NotBytes)
@@ -137,11 +90,11 @@ impl TryFrom<DecodedElement> for Vec<u8> {
     }
 }
 
-impl TryFrom<DecodedElement> for String {
+impl TryFrom<Element> for String {
     type Error = DecodeError;
 
-    fn try_from(p: DecodedElement) -> Result<Self, Self::Error> {
-        if let DecodedElement::String(v) = p {
+    fn try_from(p: Element) -> Result<Self, Self::Error> {
+        if let Element::String(v) = p {
             Ok(v)
         } else {
             Err(DecodeError::NotString)
@@ -149,11 +102,11 @@ impl TryFrom<DecodedElement> for String {
     }
 }
 
-impl TryFrom<DecodedElement> for Vec<DecodedElement> {
+impl TryFrom<Element> for Vec<Element> {
     type Error = DecodeError;
 
-    fn try_from(p: DecodedElement) -> Result<Self, Self::Error> {
-        if let DecodedElement::Array(v) = p {
+    fn try_from(p: Element) -> Result<Self, Self::Error> {
+        if let Element::Array(v) = p {
             Ok(v)
         } else {
             Err(DecodeError::NotString)
@@ -161,139 +114,25 @@ impl TryFrom<DecodedElement> for Vec<DecodedElement> {
     }
 }
 
-impl TryFrom<DecodedElement> for DecodedObject {
+impl TryFrom<Element> for Object {
     type Error = DecodeError;
 
-    fn try_from(p: DecodedElement) -> Result<Self, Self::Error> {
-        if let DecodedElement::Object(v) = p {
+    fn try_from(p: Element) -> Result<Self, Self::Error> {
+        if let Element::Object(v) = p {
             Ok(v)
-        } else if let DecodedElement::Bytes(v) = p {
-            v.as_slice().decode_protobuf()
+        } else if let Element::Bytes(v) = p {
+            Object::decode(&mut v.as_slice())
         } else {
             Err(DecodeError::NotObject)
         }
     }
 }
 
-impl From<isize> for DecodedElement {
-    fn from(value: isize) -> Self {
-        Self::Integer(value)
-    }
-}
-
-impl From<i64> for DecodedElement {
-    fn from(value: i64) -> Self {
-        Self::Integer(value as isize)
-    }
-}
-
-impl From<u64> for DecodedElement {
-    fn from(value: u64) -> Self {
-        Self::Integer(value as isize)
-    }
-}
-
-impl From<i32> for DecodedElement {
-    fn from(value: i32) -> Self {
-        Self::Integer(value as isize)
-    }
-}
-
-impl From<u32> for DecodedElement {
-    fn from(value: u32) -> Self {
-        Self::Integer(value as isize)
-    }
-}
-
-impl From<i16> for DecodedElement {
-    fn from(value: i16) -> Self {
-        Self::Integer(value as isize)
-    }
-}
-
-impl From<u16> for DecodedElement {
-    fn from(value: u16) -> Self {
-        Self::Integer(value as isize)
-    }
-}
-
-impl From<i8> for DecodedElement {
-    fn from(value: i8) -> Self {
-        Self::Integer(value as isize)
-    }
-}
-
-impl From<u8> for DecodedElement {
-    fn from(value: u8) -> Self {
-        Self::Integer(value as isize)
-    }
-}
-
-impl From<f32> for DecodedElement {
-    fn from(value: f32) -> Self {
-        Self::Double(value as f64)
-    }
-}
-
-impl From<f64> for DecodedElement {
-    fn from(value: f64) -> Self {
-        Self::Double(value)
-    }
-}
-
-impl From<&str> for DecodedElement {
-    fn from(value: &str) -> Self {
-        Self::from(value.to_string())
-    }
-}
-
-impl From<String> for DecodedElement {
-    fn from(value: String) -> Self {
-        Self::String(value)
-    }
-}
-
-impl From<Vec<u8>> for DecodedElement {
-    fn from(value: Vec<u8>) -> Self {
-        Self::Bytes(value)
-    }
-}
-
-impl<const N: usize> From<[u8; N]> for DecodedElement {
-    fn from(value: [u8; N]) -> Self {
-        Self::Bytes(value.to_vec())
-    }
-}
-
-impl From<&[u8]> for DecodedElement {
-    fn from(value: &[u8]) -> Self {
-        Self::Bytes(value.to_vec())
-    }
-}
-
-impl From<Vec<DecodedElement>> for DecodedElement {
-    fn from(value: Vec<DecodedElement>) -> Self {
-        Self::Array(value)
-    }
-}
-
-impl<const N: usize> From<[DecodedElement; N]> for DecodedElement {
-    fn from(value: [DecodedElement; N]) -> Self {
-        Self::Array(value.to_vec())
-    }
-}
-
-impl From<DecodedObject> for DecodedElement {
-    fn from(value: DecodedObject) -> Self {
-        Self::Object(value)
-    }
-}
-
 /// Protobuf 解码元素容器
 #[derive(Debug, Clone)]
-pub struct DecodedObject(HashMap<u32, DecodedElement>);
+pub struct Object(HashMap<u32, Element>);
 
-impl DecodedObject {
+impl Object {
     pub fn new() -> Self {
         Self(HashMap::new())
     }
@@ -302,50 +141,67 @@ impl DecodedObject {
         Self(HashMap::with_capacity(capacity))
     }
 
-    pub fn into_inner(self) -> HashMap<u32, DecodedElement> {
+    pub fn into_inner(self) -> HashMap<u32, Element> {
         self.0
     }
 
-    pub fn try_remove(&mut self, k: &u32) -> Result<DecodedElement, DecodeError> {
+    pub fn try_remove(&mut self, k: &u32) -> Result<Element, DecodeError> {
         self.0.remove(k).ok_or(DecodeError::ItemNotFound(*k))
     }
 
-    pub fn try_get(&mut self, k: &u32) -> Result<&DecodedElement, DecodeError> {
+    pub fn try_get(&mut self, k: &u32) -> Result<&Element, DecodeError> {
         self.0.get(k).ok_or(DecodeError::ItemNotFound(*k))
     }
-}
 
-// impl From<Vec<(u32, DecodedElement)>> for DecodedObject {
-//     fn from(arr: Vec<(u32, DecodedElement)>) -> Self {
-//         Self(arr.into_iter().collect::<HashMap<_, _>>())
-//     }
-// }
+    pub fn decode<R: Read>(reader: &mut R) -> Result<Object, DecodeError> {
+        let mut stream = CodedInputStream::new(reader);
+        Object::decode_object(&mut stream)
+    }
 
-impl<const N: usize> From<[(u32, DecodedElement); N]> for DecodedObject {
-    fn from(arr: [(u32, DecodedElement); N]) -> Self {
-        Self(HashMap::from(arr))
+    fn decode_object(stream: &mut CodedInputStream) -> Result<Object, DecodeError> {
+        let mut result = Object::with_capacity(20);
+    
+        while !stream.eof()? {
+            let k = stream.read_uint32()?;
+            let tag = k >> 3;
+            let typee = k & 0b111;
+    
+            let value = match typee {
+                0 => Element::Integer(stream.read_int64()? as i128),
+                1 => Element::Integer(stream.read_fixed64()? as i128),
+                2 => {
+                    let buf = stream.read_bytes()?;
+                    Element::Bytes(buf)
+                }
+                5 => Element::Integer(stream.read_fixed32()? as i128),
+                _ => return Err(DecodeError::InvalidType(typee)),
+            };
+    
+            if let Some(e) = result.get_mut(&tag) {
+                if let Element::Array(list) = e {
+                    list.push(value);
+                } else {
+                    let e = result.remove(&tag).unwrap();
+                    let value = Element::Array(vec![e]);
+                    result.insert(tag, value);
+                };
+            } else {
+                result.insert(tag, value);
+            }
+        }
+    
+        Ok(result)
     }
 }
 
-impl<const N: usize> From<[DecodedElement; N]> for DecodedObject {
-    fn from(arr: [DecodedElement; N]) -> Self {
-        Self(
-            arr.into_iter()
-                .enumerate()
-                .map(|(i, e)| (i as u32, e))
-                .collect::<HashMap<_, _>>(),
-        )
-    }
-}
-
-impl std::ops::DerefMut for DecodedObject {
+impl std::ops::DerefMut for Object {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
-impl std::ops::Deref for DecodedObject {
-    type Target = HashMap<u32, DecodedElement>;
+impl std::ops::Deref for Object {
+    type Target = HashMap<u32, Element>;
 
     fn deref(&self) -> &Self::Target {
         &self.0

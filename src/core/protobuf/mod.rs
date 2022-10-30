@@ -6,10 +6,9 @@ mod test {
     use crate::{
         core::{
             io::WriteExt,
-            protobuf::encode::{EncodeProtobuf, EncodedObject},
+            protobuf::encode::{Element, Object},
         },
         error::Error,
-        to_protobuf,
     };
 
     #[test]
@@ -20,24 +19,24 @@ mod test {
 
         println!("{:02x?} {}", buf, buf.len());
 
-        let encoded = EncodedObject::from([
-            (1, to_protobuf!(1152)),
-            (2, to_protobuf!(9)),
-            (3, to_protobuf!("242423424")),
-            (4, to_protobuf!(buf.as_slice())),
-            (5, to_protobuf!(213.435)),
+        let encoded = Object::from([
+            (1, Element::from(1152)),
+            (2, Element::from(9)),
+            (3, Element::from("242423424")),
+            (4, Element::from(buf.as_slice())),
+            (5, Element::from(213.435)),
             (
                 6,
-                to_protobuf!(&EncodedObject::from([
-                    (1, to_protobuf!(2)),
-                    (2, to_protobuf!("sdf"))
+                Element::from(Object::from([
+                    (1, Element::from(2)),
+                    (2, Element::from("sdf")),
                 ])),
             ),
             (
                 7,
-                to_protobuf!(vec![to_protobuf!(123), to_protobuf!("345")]),
+                Element::from(vec![Element::from(123), Element::from("345")]),
             ),
-            (8, to_protobuf!([to_protobuf!(43), to_protobuf!("dfg")])),
+            (8, Element::from([Element::from(43), Element::from("dfg")])),
         ])
         .encode()?;
 
